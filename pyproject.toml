@@ -1,0 +1,34 @@
+[project]
+name = "spectral-paths"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Milo Coombs2002",email = "milo.coombs7@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.12,<4.0"
+dependencies = [
+    "numpy (<2.4)",
+    "numba (>=0.63.1,<0.64.0)",
+    "scikit-learn (>=1.8.0,<2.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "pytest (>=9.0.2,<10.0.0)",
+    "ruff (>=0.14.11,<0.15.0)"
+]
+
+[tool.mypy]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["numba", "numba.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
