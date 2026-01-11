@@ -2,79 +2,23 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
 from itertools import combinations
-from typing import Dict, Iterable, List, Literal, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
-from numba import njit, prange
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score, mean_squared_error
 from sklearn.preprocessing import StandardScaler, RobustScaler, QuantileTransformer
 
-
-Array = np.ndarray
-MVec = Tuple[int, ...]
-PVec = Tuple[int, ...]
-PR = Tuple[PVec, int]
-
-
-@njit(cache=True)
-def _cos_chebyshev(phi: float, r: int) -> float:
-    if r == 0:
-        return 1.0
-    cos_x = math.cos(phi)
-    if r == 1:
-        return cos_x
-    t_nm2 = 1.0  # T_0
-    t_nm1 = cos_x  # T_1
-    for _ in range(2, r + 1):
-        t_n = 2.0 * cos_x * t_nm1 - t_nm2  # T_n recurrence
-        t_nm2, t_nm1 = t_nm1, t_n
-    return t_nm1
-
-
-@njit(parallel=True, cache=True)
-def _build_features_numba(theta_batch: Array, p_mat: Array, r_arr: Array, include_intercept: bool) -> Array:
-    """Optimized feature building with parallel computation."""
-    B, D = theta_batch.shape
-    Q = p_mat.shape[0]
-    M = Q + (1 if include_intercept else 0)
-    out = np.empty((B, M), dtype=theta_batch.dtype)
-
-    # Intercept first to keep parity with previous layout
-    start_col = 0
-    if include_intercept:
-        out[:, 0] = 1.0
-        start_col = 1
-
-    # Compute phases in parallel over samples
-    phases = np.zeros((B, Q), dtype=theta_batch.dtype)
-    for i in prange(B):
-        for q in range(Q):
-            phi = 0.0
-            for d in range(D):
-                phi += theta_batch[i, d] * p_mat[q, d]
-            phases[i, q] = phi
-
-    # Apply Chebyshev transform in parallel over features
-    for q in prange(Q):
-        r = int(r_arr[q])
-        for i in range(B):
-            out[i, start_col + q] = _cos_chebyshev(phases[i, q], r)
-
-    return out
-
-
-@dataclass
-class FitReport:
-    lambda_star: float
-    selected_count: int
-    greedy_time_sec: float
-    final_solve_time_sec: float
-    history: List[Tuple[int, int, float, float]]  # (k_added, block_size, lambda_used, r2_val_after)
-    stopped_early: bool
-    feature_importance: Optional[Array] = None
+from spectral_paths.schemas import FitReport
+from spectral_paths.types import Array, MVec, PVec, PR, ScalerTypes
+from spectral_paths.helpers import (
+    _build_features_numba,
+    _compute_initial_importance,
+    _group_by_primitive,
+    _pr_list_to_arrays,
+    _metrics
+)
 
 
 class SpectralPathRegressorCosineOnly:
@@ -94,7 +38,7 @@ class SpectralPathRegressorCosineOnly:
         total_cols: int,
         block_size: int,
         lambda_grid: Sequence[float] = (0.01, 0.1, 1.0),
-        L_max: Optional[int] = None,
+        L_max: int | None = None,
         batch_rows: int = 2048,
         k_values: Sequence[int] = (1, 2, 3),
         val_size: float = 0.25,
@@ -105,29 +49,15 @@ class SpectralPathRegressorCosineOnly:
         normalize_intercept: bool = False,
         eps_col_norm: float = 1e-12,
         use_float32: bool = False,
-        # New parameters
         early_stopping_patience: int = 3,
         early_stopping_tol: float = 1e-4,
 
-        # -------- NEW: scaler config --------
-        scaler_type: Literal[
-            "standard_minmax",
-            "standard_percentile_minmax",
-            "robust_qclip_minmax",
-            "robust_sigclip_minmax",
-            "quantile_uniform"
-        ] = "standard_percentile_minmax",
-        # used by standard_minmax / standard_percentile_minmax:
+        # -------- scaler config --------
+        scaler_type: ScalerTypes = "standard_percentile_minmax",
         scaling_margin: float = 0.1,
         percentile_range: Tuple[float, float] = (1.0, 99.0),
-
-        # used by robust_qclip_minmax:
         robust_clip_quantiles: Tuple[float, float] = (2.0, 98.0),
-
-        # used by robust_sigclip_minmax:
         robust_sigma_clip: float = 3.0,
-
-        # used by quantile_uniform:
         quantile_n_quantiles: int = 1000,
         quantile_subsample: int = 200000,
         quantile_random_state: int = 42,
@@ -138,7 +68,64 @@ class SpectralPathRegressorCosineOnly:
 
         # (kept for backward-compat; if you still pass them, we’ll map to scaler_type)
         use_percentile_scaling: bool = False,
-    ):
+    ) -> None:
+        """
+        Initialise a spectral path regression model.
+
+        Parameters:
+            total_cols (int): Total number of input features (after preprocessing).
+            block_size (int): Number of spectral paths added per greedy expansion step.
+            lambda_grid (Sequence[float]): Candidate ridge regularisation strengths to
+                evaluate during validation-based selection.
+            L_max (int | None): Maximum harmonic order allowed along any primitive ray.
+                If None, no explicit harmonic cutoff is enforced.
+            batch_rows : int, default=2048
+                Number of samples processed per batch when streaming Gram matrices.
+            k_values (Sequence[int]): Allowed sparsity levels for spectral paths (number
+                of interacting features per path).
+            val_size (float): Fraction of data reserved for validation during greedy
+                selection.
+            random_state (int): Random seed used for data splitting and stochastic
+                components.
+            verbose (bool): Whether to emit progress and diagnostic information during
+                fitting.
+            final_lambda_refit (bool): Whether to refit coefficients using the selected
+                regularisation parameter on the combined train and validation data.
+            normalize_columns (bool): Whether to normalise feature columns prior to
+                regression.
+            normalize_intercept (bool): Whether to normalise the intercept term 
+                alongside feature columns.
+            eps_col_norm (float): Small constant used to stabilise column normalisation.
+            use_float32 (bool): Whether to use float32 arithmetic internally instead of
+                float64.
+            early_stopping_patience (int): Number of consecutive non-improving rounds
+                tolerated before early stopping of greedy path selection.
+            early_stopping_tol (float): Minimum validation improvement required to reset
+                early stopping.
+            scaler_type (ScalerTypes): Scaling strategy used to map inputs to the
+                interval [-1, 1] prior to the angular transformation.
+            scaling_margin (float): Margin applied when using min-max based scaling
+                strategies.
+            percentile_range (Tuple[float, float]): Lower and upper percentiles used for
+                percentile-based scaling.
+            robust_clip_quantiles (Tuple[float, float]): Quantile bounds used for robust
+                clipping.
+            robust_sigma_clip (float): Sigma threshold used for robust z-score clipping.
+            quantile_n_quantiles (int): Number of quantiles used by the quantile-based
+                scaler.
+            quantile_subsample (int): Subsample size used when fitting the
+                quantile-based scaler.
+            quantile_random_state (int): Random seed used by the quantile-based scaler.
+            adaptive_block_size (bool): Whether to adapt the block size during greedy
+                selection based on validation behaviour.
+            min_block_size (int): Minimum block size allowed when adaptive scheduling is
+                enabled.
+            use_importance_ordering (bool): Whether to prioritise candidate paths using
+                univariate importanceheuristics.
+            use_percentile_scaling (bool): Deprecated flag retained for backward
+                compatibility. If enabled maps to 
+                ``scaler_type="standard_percentile_minmax"``.
+    """
         self.total_cols = int(total_cols)
         self.block_size = int(block_size)
         self.lambda_grid = list(lambda_grid)
@@ -153,7 +140,6 @@ class SpectralPathRegressorCosineOnly:
         self.normalize_intercept = bool(normalize_intercept)
         self.eps_col_norm = float(eps_col_norm)
         self.use_float32 = bool(use_float32)
-
         self.early_stopping_patience = int(early_stopping_patience)
         self.early_stopping_tol = float(early_stopping_tol)
 
@@ -170,33 +156,26 @@ class SpectralPathRegressorCosineOnly:
         self.quantile_n_quantiles = int(quantile_n_quantiles)
         self.quantile_subsample = int(quantile_subsample)
         self.quantile_random_state = int(quantile_random_state)
-
         self.adaptive_block_size = bool(adaptive_block_size)
         self.min_block_size = int(min_block_size)
         self.use_importance_ordering = bool(use_importance_ordering)
-
-        # Learned attributes
         self.is_fitted_: bool = False
-        self.n_features_in_: Optional[int] = None
-
-        # -------- NEW: we generalize "scaler_" into a base transformer + post params --------
-        self.base_scaler_ = None  # StandardScaler / RobustScaler / QuantileTransformer
-        self.x_min_: Optional[Array] = None   # for affine map to [-1,1]
-        self.span_: Optional[Array] = None    # for affine map to [-1,1]
-        self.z_clip_lo_: Optional[Array] = None  # clipping bounds in z-space (robust clip / sigma clip)
-        self.z_clip_hi_: Optional[Array] = None
-
-        # (rest unchanged)
-        self.selected_indices_: Optional[List[MVec]] = None
-        self.pr_list_: Optional[List[PR]] = None
-        self.p_to_maxr_: Optional[Dict[PVec, int]] = None
-        self.lambda_: Optional[float] = None
-        self.coef_: Optional[Array] = None
-        self.fit_report_: Optional[FitReport] = None
-        self.p_mat_: Optional[Array] = None
-        self.r_arr_: Optional[Array] = None
-        self.feature_importance_: Optional[Array] = None
-        self._feature_buffer_: Optional[Array] = None
+        self.n_features_in_: int | None = None
+        self.base_scaler_ = None
+        self.x_min_: Array | None = None
+        self.span_: Array | None = None
+        self.z_clip_lo_: Array | None = None
+        self.z_clip_hi_: Array | None = None
+        self.selected_indices_: List[MVec] | None = None
+        self.pr_list_: List[PR] | None = None
+        self.p_to_maxr_: Dict[PVec, int] | None = None
+        self.lambda_: float | None = None
+        self.coef_: Array | None = None
+        self.fit_report_: FitReport | None = None
+        self.p_mat_: Array | None = None
+        self.r_arr_: Array | None = None
+        self.feature_importance_: Array | None = None
+        self._feature_buffer_: Array | None = None
 
     # ------------------- Public API -------------------
     def _fit_transformer(self, X_tr: Array) -> None:
@@ -204,7 +183,7 @@ class SpectralPathRegressorCosineOnly:
         Fit scaling so that X_u is in [-1,1] while reducing outlier influence.
 
         Supported scaler_type:
-          - "standard_minmax"            : StandardScaler -> min/max (+ margin) -> [-1,1]
+          - "standard_minmax"            : StandardScaler -> min/max (+margin) -> [-1,1]
           - "standard_percentile_minmax" : StandardScaler -> percentile range -> [-1,1]
           - "robust_qclip_minmax"        : RobustScaler -> clip quantiles -> [-1,1]
           - "robust_sigclip_minmax"      : RobustScaler -> clip +/- k*sigma -> [-1,1]
@@ -245,7 +224,10 @@ class SpectralPathRegressorCosineOnly:
             return
 
         if st == "robust_qclip_minmax":
-            self.base_scaler_ = RobustScaler(with_centering=True, with_scaling=True).fit(X_tr)
+            self.base_scaler_ = RobustScaler(
+                with_centering=True,
+                with_scaling=True
+            ).fit(X_tr)
             Z = self.base_scaler_.transform(X_tr)
 
             lo, hi = self.robust_clip_quantiles
@@ -297,13 +279,14 @@ class SpectralPathRegressorCosineOnly:
             "'standard_minmax', 'standard_percentile_minmax', "
             "'robust_qclip_minmax', 'robust_sigclip_minmax', 'quantile_uniform'."
         )
+
     def fit(
         self,
         X: Array,
         y: Array,
         *,
-        X_val: Optional[Array] = None,
-        y_val: Optional[Array] = None,
+        X_val: Array | None = None,
+        y_val: Array | None = None,
     ) -> "SpectralPathRegressorCosineOnly":
         X = np.asarray(X)
         y = np.asarray(y, dtype=float).ravel()
@@ -338,7 +321,11 @@ class SpectralPathRegressorCosineOnly:
         
         # Compute initial feature importance for smart path ordering
         if self.use_importance_ordering:
-            self.feature_importance_ = self._compute_initial_importance(theta_tr, y_tr, D)
+            self.feature_importance_ = _compute_initial_importance(
+                theta_tr,
+                y_tr,
+                D
+            )
         else:
             self.feature_importance_ = None
 
@@ -372,8 +359,8 @@ class SpectralPathRegressorCosineOnly:
         self.coef_ = w_star.astype(float, copy=False)
 
         # Cache ray structures for predict
-        self.pr_list_, self.p_to_maxr_ = self._group_by_primitive(self.selected_indices_)
-        self.p_mat_, self.r_arr_ = self._pr_list_to_arrays(self.pr_list_, self.n_features_in_)
+        self.pr_list_, self.p_to_maxr_ = _group_by_primitive(self.selected_indices_)
+        self.p_mat_, self.r_arr_ = _pr_list_to_arrays(self.pr_list_, self.n_features_in_)
         
         # Compute feature importance from final model
         final_importance = self._compute_feature_importance_from_model()
@@ -417,40 +404,11 @@ class SpectralPathRegressorCosineOnly:
         yhat = self.predict(X)
         return float(r2_score(y, yhat))
 
-    # ------------------- Transformer (IMPROVED) -------------------
-
-    # def _fit_transformer(self, X_tr: Array) -> None:
-    #     """Improved transformer with margins and percentile-based scaling."""
-    #     self.scaler_ = StandardScaler().fit(X_tr)
-    #     X_tr_z = self.scaler_.transform(X_tr)
-
-    #     if self.use_percentile_scaling:
-    #         # Use percentiles to be robust to outliers
-    #         x_min = np.percentile(X_tr_z, self.percentile_range[0], axis=0)
-    #         x_max = np.percentile(X_tr_z, self.percentile_range[1], axis=0)
-    #     else:
-    #         # Add margin to avoid boundary issues with test data
-    #         x_min_raw = X_tr_z.min(axis=0)
-    #         x_max_raw = X_tr_z.max(axis=0)
-            
-    #         margin_low = self.scaling_margin * np.abs(x_min_raw)
-    #         margin_high = self.scaling_margin * np.abs(x_max_raw)
-            
-    #         x_min = x_min_raw - margin_low
-    #         x_max = x_max_raw + margin_high
-
-    #     span = np.where((x_max - x_min) == 0.0, 1.0, (x_max - x_min))
-
-    #     self.x_min_ = x_min
-    #     self.span_ = span
-
     def _X_to_theta(self, X: Array) -> Array:
         if self.base_scaler_ is None:
             raise RuntimeError("Transformer not fitted.")
 
-        st = self.scaler_type
-
-        if st == "quantile_uniform":
+        if self.scaler_type == "quantile_uniform":
             U = self.base_scaler_.transform(X)  # in [0,1]
             X_u = (2.0 * U) - 1.0
             X_u = np.clip(X_u, -1.0, 1.0)
@@ -469,25 +427,8 @@ class SpectralPathRegressorCosineOnly:
         X_u = np.clip(X_u, -1.0, 1.0)
         return np.arccos(X_u)
 
-    # ------------------- Feature Importance -------------------
     
-    def _compute_initial_importance(self, theta_tr: Array, y_tr: Array, D: int) -> Array:
-        """Compute initial feature importance using univariate correlations in angular space."""
-        importance = np.zeros(D, dtype=float)
-        
-        for j in range(D):
-            # Compute correlation between cos(theta_j) and y
-            cos_theta_j = np.cos(theta_tr[:, j])
-            corr = np.abs(np.corrcoef(cos_theta_j, y_tr)[0, 1])
-            importance[j] = corr if not np.isnan(corr) else 0.0
-        
-        # Normalize
-        if importance.sum() > 0:
-            importance = importance / importance.sum()
-        
-        return importance
-    
-    def _compute_feature_importance_from_model(self) -> Array:
+    def _compute_feature_importance_from_model(self) -> Array | None:
         """Compute feature importance from learned coefficients."""
         if self.selected_indices_ is None or self.coef_ is None:
             return None
@@ -532,8 +473,8 @@ class SpectralPathRegressorCosineOnly:
         self, 
         D: int, 
         r: int, 
-        L_max: Optional[int],
-        feature_importance: Optional[Array] = None
+        L_max: int | None,
+        feature_importance: Array | None = None
     ) -> Iterable[MVec]:
         """Generate k-sparse paths, optionally prioritizing high-importance features."""
         if feature_importance is not None and self.use_importance_ordering:
@@ -552,45 +493,6 @@ class SpectralPathRegressorCosineOnly:
                     yield tuple(m)
             L += 1
 
-    # ------------------- Primitive rays -------------------
-
-    def _gcd_list(self, vals: Sequence[int]) -> int:
-        g = 0
-        for v in vals:
-            g = math.gcd(g, int(abs(v)))
-        return g
-
-    def _primitive_and_order(self, m: MVec) -> PR:
-        nonzeros = [v for v in m if v != 0]
-        g = self._gcd_list(nonzeros) if nonzeros else 1
-        if g == 0:
-            g = 1
-        p = tuple((vi // g) for vi in m)
-        r = g
-        return p, r
-
-    def _group_by_primitive(self, indices_nonzero: Sequence[MVec]) -> Tuple[List[PR], Dict[PVec, int]]:
-        pr_list: List[PR] = []
-        p_to_orders: Dict[PVec, set] = {}
-        for m in indices_nonzero:
-            p, r = self._primitive_and_order(m)
-            pr_list.append((p, r))
-            p_to_orders.setdefault(p, set()).add(r)
-        p_to_maxr = {p: max(orders) for p, orders in p_to_orders.items()}
-        return pr_list, p_to_maxr
-
-    def _pr_list_to_arrays(self, pr_list: List[PR], D: Optional[int]) -> Tuple[Array, Array]:
-        if not pr_list:
-            D_eff = int(D) if D is not None else 0
-            return np.zeros((0, D_eff), dtype=np.int64), np.zeros((0,), dtype=np.int64)
-        D_eff = len(pr_list[0][0]) if D is None else int(D)
-        p_mat = np.zeros((len(pr_list), D_eff), dtype=np.int64)
-        r_arr = np.zeros((len(pr_list),), dtype=np.int64)
-        for idx, (p, r) in enumerate(pr_list):
-            p_mat[idx, :] = np.array(p, dtype=np.int64)
-            r_arr[idx] = int(r)
-        return p_mat, r_arr
-
     # ------------------- Feature building (uses optimized numba) -------------------
 
     def _build_batch_features_graph_cos(
@@ -601,7 +503,7 @@ class SpectralPathRegressorCosineOnly:
         *,
         include_intercept: bool,
     ) -> Array:
-        p_mat, r_arr = self._pr_list_to_arrays(pr_list, theta_batch.shape[1])
+        p_mat, r_arr = _pr_list_to_arrays(pr_list, theta_batch.shape[1])
         theta_local = theta_batch.astype(np.float32 if self.use_float32 else np.float64, copy=False)
         return _build_features_numba(theta_local, p_mat, r_arr, include_intercept)
 
@@ -649,9 +551,14 @@ class SpectralPathRegressorCosineOnly:
 
     # ------------------- Streamed Gram / predict -------------------
 
-    def _streamed_gram_cos(self, theta: Array, y: Array, indices_nonzero: Sequence[MVec]) -> Tuple[Array, Array]:
-        pr_list, _ = self._group_by_primitive(indices_nonzero)
-        p_mat, r_arr = self._pr_list_to_arrays(pr_list, theta.shape[1])
+    def _streamed_gram_cos(
+            self,
+            theta: Array,
+            y: Array,
+            indices_nonzero: Sequence[MVec]
+        ) -> Tuple[Array, Array]:
+        pr_list, _ = _group_by_primitive(indices_nonzero)
+        p_mat, r_arr = _pr_list_to_arrays(pr_list, theta.shape[1])
         M = 1 + len(pr_list)
         G = np.zeros((M, M), dtype=float)
         b = np.zeros(M, dtype=float)
@@ -659,7 +566,10 @@ class SpectralPathRegressorCosineOnly:
         N = theta.shape[0]
         for start in range(0, N, self.batch_rows):
             end = min(N, start + self.batch_rows)
-            theta_b = theta[start:end].astype(np.float32 if self.use_float32 else np.float64, copy=False)
+            theta_b = theta[start:end].astype(
+                np.float32 if self.use_float32 else np.float64,
+                copy=False
+            )
             Phi_b = _build_features_numba(theta_b, p_mat, r_arr, True)
             y_b = y[start:end]
             G += Phi_b.T @ Phi_b
@@ -673,15 +583,15 @@ class SpectralPathRegressorCosineOnly:
         pr_list: List[PR],
         p_to_maxr: Dict[PVec, int],
         w: Array,
-        p_mat: Optional[Array] = None,
-        r_arr: Optional[Array] = None,
+        p_mat: Array | None = None,
+        r_arr: Array | None = None,
     ) -> Array:
         if p_mat is None or r_arr is None:
             if self.p_mat_ is not None and self.r_arr_ is not None:
                 p_mat = self.p_mat_
                 r_arr = self.r_arr_
             else:
-                p_mat, r_arr = self._pr_list_to_arrays(pr_list, theta.shape[1])
+                p_mat, r_arr = _pr_list_to_arrays(pr_list, theta.shape[1])
 
         N = theta.shape[0]
         yhat = np.empty(N, dtype=float)
@@ -698,11 +608,6 @@ class SpectralPathRegressorCosineOnly:
 
         return yhat
 
-    def _metrics(self, y_true: Array, y_pred: Array) -> Tuple[float, float]:
-        rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
-        r2 = float(r2_score(y_true, y_pred))
-        return rmse, r2
-
     # ------------------- Final λ selection on fixed dictionary -------------------
 
     def _select_lambda_from_gram(
@@ -718,8 +623,8 @@ class SpectralPathRegressorCosineOnly:
         best_lam = float(lambda_grid[0])
 
         # Precompute structures once for validation prediction speed
-        pr_list, p_to_maxr = self._group_by_primitive(indices_nonzero)
-        p_mat, r_arr = self._pr_list_to_arrays(pr_list, theta_val.shape[1])
+        pr_list, p_to_maxr = _group_by_primitive(indices_nonzero)
+        p_mat, r_arr = _pr_list_to_arrays(pr_list, theta_val.shape[1])
 
         # Cache eigendecomp for lambda sweep
         if self.normalize_columns:
@@ -742,7 +647,7 @@ class SpectralPathRegressorCosineOnly:
         for lam in lambda_grid:
             w = solve_for_lambda(float(lam))
             y_val_hat = self._streamed_predict_from_struct(theta_val, pr_list, p_to_maxr, w, p_mat, r_arr)
-            _, r2v = self._metrics(y_val, y_val_hat)
+            _, r2v = _metrics(y_val, y_val_hat)
             if r2v > best_r2:
                 best_r2 = r2v
                 best_lam = float(lam)
@@ -770,7 +675,7 @@ class SpectralPathRegressorCosineOnly:
 
         selected: List[MVec] = []
         history: List[Tuple[int, int, float, float]] = []
-        lambda_star: Optional[float] = None
+        lambda_star: float | None = None
         
         # Early stopping trackers
         best_val_overall = -1e18
@@ -807,15 +712,15 @@ class SpectralPathRegressorCosineOnly:
                 break
 
             # Structures for current dictionary (train + val prediction)
-            pr_old, pmax_old = self._group_by_primitive(selected)
-            p_mat_old, r_arr_old = self._pr_list_to_arrays(pr_old, D)
+            pr_old, pmax_old = _group_by_primitive(selected)
+            p_mat_old, r_arr_old = _pr_list_to_arrays(pr_old, D)
             M_old = 1 + len(pr_old)
 
             # Structures for each candidate block
             cand_struct: Dict[int, Tuple[List[PR], Dict[PVec, int], Array, Array]] = {}
             for k, blk in candidates.items():
-                pr_blk, pmax_blk = self._group_by_primitive(blk)
-                p_mat_blk, r_arr_blk = self._pr_list_to_arrays(pr_blk, D)
+                pr_blk, pmax_blk = _group_by_primitive(blk)
+                p_mat_blk, r_arr_blk = _pr_list_to_arrays(pr_blk, D)
                 cand_struct[k] = (pr_blk, pmax_blk, p_mat_blk, r_arr_blk)
 
             # Allocate accumulators per candidate: C (M_old x Qnew), Gnew (Qnew x Qnew), bnew (Qnew)
@@ -876,8 +781,8 @@ class SpectralPathRegressorCosineOnly:
                     best_lam_this = float(self.lambda_grid[0]) if self.lambda_grid else 0.0
                     # Precompute validation structures once for this trial dict
                     trial_indices = selected + blk
-                    pr_trial, pmax_trial = self._group_by_primitive(trial_indices)
-                    p_mat_trial, r_arr_trial = self._pr_list_to_arrays(pr_trial, theta_val.shape[1])
+                    pr_trial, pmax_trial = _group_by_primitive(trial_indices)
+                    p_mat_trial, r_arr_trial = _pr_list_to_arrays(pr_trial, theta_val.shape[1])
 
                     if self.normalize_columns:
                         s_trial = self._column_scales_from_gram(G_trial)
@@ -901,7 +806,7 @@ class SpectralPathRegressorCosineOnly:
                         y_val_hat = self._streamed_predict_from_struct(
                             theta_val, pr_trial, pmax_trial, w, p_mat_trial, r_arr_trial
                         )
-                        _, r2v = self._metrics(y_val, y_val_hat)
+                        _, r2v = _metrics(y_val, y_val_hat)
                         if r2v > best_r2_this:
                             best_r2_this = r2v
                             best_lam_this = float(lam)
@@ -910,13 +815,13 @@ class SpectralPathRegressorCosineOnly:
                     cand_lam = float(best_lam_this)
                 else:
                     trial_indices = selected + blk
-                    pr_trial, pmax_trial = self._group_by_primitive(trial_indices)
-                    p_mat_trial, r_arr_trial = self._pr_list_to_arrays(pr_trial, theta_val.shape[1])
+                    pr_trial, pmax_trial = _group_by_primitive(trial_indices)
+                    p_mat_trial, r_arr_trial = _pr_list_to_arrays(pr_trial, theta_val.shape[1])
                     w = self._solve_ridge_from_gram(G_trial, b_trial, float(lambda_star))
                     y_val_hat = self._streamed_predict_from_struct(
                         theta_val, pr_trial, pmax_trial, w, p_mat_trial, r_arr_trial
                     )
-                    _, cand_val = self._metrics(y_val, y_val_hat)
+                    _, cand_val = _metrics(y_val, y_val_hat)
                     cand_lam = float(lambda_star)
 
                 if cand_val > best_val:
@@ -973,70 +878,3 @@ class SpectralPathRegressorCosineOnly:
     def _check_fitted(self) -> None:
         if not self.is_fitted_ or self.coef_ is None or self.selected_indices_ is None:
             raise RuntimeError("Model is not fitted yet. Call fit(X, y) first.")
-
-
-# ------------------- Example usage -------------------
-if __name__ == "__main__":
-    from ucimlrepo import fetch_ucirepo
-
-    ds = fetch_ucirepo(id=327)
-    X = ds.data.features.values
-    y = ds.data.targets.values.astype(float).ravel()
-
-    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.20, random_state=42)
-
-    D = X.shape[1]
-
-    mdl = SpectralPathRegressorCosineOnly(
-        total_cols=22 * D,
-        block_size=1 * D,
-        lambda_grid=[0.0005,0.001, 0.003, 0.01, 0.03],
-        L_max=None,
-        scaler_type="standard_percentile_minmax",
-        robust_clip_quantiles=(2.0, 98.0),
-        batch_rows=2048,
-        verbose=True,
-        random_state=42,
-        val_size=0.25,
-        final_lambda_refit=True,
-        normalize_columns=True,
-        normalize_intercept=False,
-        k_values=(1,2,3,4),
-        # New improved parameters
-        early_stopping_patience=5,
-        early_stopping_tol= 1e-4,
-        scaling_margin=0.1,
-        use_percentile_scaling=False,
-        adaptive_block_size=True,
-        min_block_size=1,
-        use_importance_ordering=True,
-    )
-    print("Training model...")
-    t0 = time.perf_counter()
-    mdl.fit(X_tr, y_tr)
-    t1 = time.perf_counter()
-    
-    print(f"\nTotal training time: {t1-t0:.3f}s")
-
-    yhat = mdl.predict(X_te)
-
-    rmse = float(np.sqrt(mean_squared_error(y_te, yhat)))
-    r2 = float(r2_score(y_te, yhat))
-
-    print("\n=== Test ===")
-    print(f"R²:   {r2:.4f}")
-    print(f"RMSE: {rmse:.4f}")
-
-    if mdl.fit_report_ is not None:
-        print("\n=== Timing ===")
-        print(f"Greedy selection: {mdl.fit_report_.greedy_time_sec:.3f}s")
-        print(f"Final solve:      {mdl.fit_report_.final_solve_time_sec:.3f}s")
-        print(f"Selected cols:    {mdl.fit_report_.selected_count} (+ intercept)")
-        print(f"λ*:               {mdl.fit_report_.lambda_star}")
-        print(f"Stopped early:    {mdl.fit_report_.stopped_early}")
-        
-        if mdl.fit_report_.feature_importance is not None:
-            print("\n=== Top 5 Most Important Features ===")
-            top_idx = np.argsort(-mdl.fit_report_.feature_importance)[:5]
-            for rank, idx in enumerate(top_idx, 1):
-                print(f"{rank}. Feature {idx}: {mdl.fit_report_.feature_importance[idx]:.4f}")

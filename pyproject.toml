@@ -32,3 +32,11 @@ module = ["numba", "numba.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
 
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E"]  # includes E501 (line too long)
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
