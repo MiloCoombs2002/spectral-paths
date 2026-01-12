@@ -157,7 +157,7 @@ def _primitive_and_order(m: MVec) -> PR:
 
 def _group_by_primitive(
         indices_nonzero: Sequence[MVec]
-    ) -> Tuple[List[PR], Dict[PVec, int]]:
+    ) -> List[PR]:
     """
     Group frequency vectors by primitive direction.
 
@@ -175,8 +175,7 @@ def _group_by_primitive(
         p, r = _primitive_and_order(m)
         pr_list.append((p, r))
         p_to_orders.setdefault(p, set()).add(r)
-    p_to_maxr = {p: max(orders) for p, orders in p_to_orders.items()}
-    return pr_list, p_to_maxr
+    return pr_list
 
 def _pr_list_to_arrays(pr_list: List[PR], D: int | None) -> Tuple[Array, Array]:
     """

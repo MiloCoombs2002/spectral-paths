@@ -7,10 +7,16 @@ MVec = Tuple[int, ...]
 PVec = Tuple[int, ...]
 PR = Tuple[PVec, int]
 
-ScalerTypes = Literal[
+ScalerType = Literal[
     "standard_minmax",
     "standard_percentile_minmax",
     "robust_qclip_minmax",
     "robust_sigclip_minmax",
-    "quantile_uniform"
+    "robust_percentile_minmax",
+    "quantile_uniform",
+    "standard",
+    "standard_tanh",
+    "minmax",
+    "robust",
+    "robust_tanh"
 ]
