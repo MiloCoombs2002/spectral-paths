@@ -1,43 +1,45 @@
+"""
+Spectral path regression model.
+
+This module implements the `SpectralPathRegressor` model.
+"""
 from __future__ import annotations
 
 import time
 from itertools import combinations
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterator, List, Sequence, Tuple, cast
 
 import numpy as np
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
+from sklearn.model_selection import train_test_split
 
 from spectral_paths.schemas import FitReport
-from spectral_paths.types import Array, MVec, PVec, PR, ScalerType
-from spectral_paths.utils.preprocessing import AngularTransformer
+from spectral_paths.types import PR, Array, MVec, ScalerType
 from spectral_paths.utils.helpers import (
     _build_features_numba,
     _compute_initial_importance,
     _group_by_primitive,
+    _metrics,
     _pr_list_to_arrays,
-    _metrics
 )
+from spectral_paths.utils.preprocessing import AngularTransformer
 
 
 class SpectralPathRegressor:
     """
-    Improved Spectral Path Regressor with:
-    - Parallel feature computation
-    - Early stopping in greedy selection
-    - Smart feature importance-based path generation
-    - Improved input scaling with margins
-    - Adaptive block sizing
-    - Memory optimizations
-    """
+    Spectral-path regression model.
 
+    This estimator builds spectral path features, selects a sparse dictionary
+    via a greedy procedure, and fits ridge-style coefficients with optional
+    early stopping and final refit.
+    """
     def __init__(
         self,
         *,
         total_cols: int,
         block_size: int,
         lambda_grid: Sequence[float] = (0.01, 0.1, 1.0),
-        L_max: int | None = None,
+        l_max: int | None = None,
         batch_rows: int = 2048,
         k_values: Sequence[int] = (1, 2, 3),
         val_size: float = 0.25,
@@ -68,7 +70,7 @@ class SpectralPathRegressor:
             block_size (int): Number of spectral paths added per greedy expansion step.
             lambda_grid (Sequence[float]): Candidate ridge regularisation strengths to
                 evaluate during validation-based selection.
-            L_max (int | None): Maximum harmonic order allowed along any primitive ray.
+            l_max (int | None): Maximum harmonic order allowed along any primitive ray.
                 If None, no explicit harmonic cutoff is enforced.
             batch_rows : int, default=2048
                 Number of samples processed per batch when streaming Gram matrices.
@@ -84,7 +86,7 @@ class SpectralPathRegressor:
                 regularisation parameter on the combined train and validation data.
             normalize_columns (bool): Whether to normalise feature columns prior to
                 regression.
-            normalize_intercept (bool): Whether to normalise the intercept term 
+            normalize_intercept (bool): Whether to normalise the intercept term
                 alongside feature columns.
             eps_col_norm (float): Small constant used to stabilise column normalisation.
             use_float32 (bool): Whether to use float32 arithmetic internally instead of
@@ -103,11 +105,11 @@ class SpectralPathRegressor:
                 enabled.
             use_importance_ordering (bool): Whether to prioritise candidate paths using
                 univariate importanceheuristics.
-    """
+        """
         self.total_cols = int(total_cols)
         self.block_size = int(block_size)
         self.lambda_grid = list(lambda_grid)
-        self.L_max = L_max
+        self.l_max = l_max
         self.batch_rows = int(batch_rows)
         self.k_values = tuple(int(k) for k in k_values)
         self.val_size = float(val_size)
@@ -130,7 +132,7 @@ class SpectralPathRegressor:
         self.use_importance_ordering = bool(use_importance_ordering)
         self.is_fitted_: bool = False
         self.n_features_in_: int | None = None
-        
+
         self.selected_indices_: List[MVec] | None = None
         self.pr_list_: List[PR] | None = None
         self.lambda_: float | None = None
@@ -144,7 +146,7 @@ class SpectralPathRegressor:
     def _make_transformer(self) -> AngularTransformer:
         """
         Construct an AngularTransformer instance from this model's scaler config.
-        
+
         Returns:
             AngularTransformer: an instance of AngularTransformer
         """
@@ -162,12 +164,12 @@ class SpectralPathRegressor:
         )
 
     def fit(
-        self,
-        X: Array,
-        y: Array,
-        *,
-        X_val: Array | None = None,
-        y_val: Array | None = None,
+            self,
+            X: Array,
+            y: Array,
+            *,
+            X_val: Array | None = None,
+            y_val: Array | None = None
     ) -> "SpectralPathRegressor":
         """Fit the model."""
         X = np.asarray(X)
@@ -195,13 +197,17 @@ class SpectralPathRegressor:
             if X_val.shape[0] != y_val.shape[0]:
                 raise ValueError("X_val rows must match y_val length.")
 
+        # Assertions for type checking
+        assert X_val is not None
+        assert y_val is not None
+
         # Fit transform parameters on training only
         self.transformer_ = self._make_transformer()
         theta_tr = self.transformer_.fit_transform(X_tr)
         theta_val = self.transformer_.transform(X_val)
 
         D = theta_tr.shape[1]
-        
+
         # Compute initial feature importance for smart path ordering
         if self.use_importance_ordering:
             self.feature_importance_ = _compute_initial_importance(
@@ -258,7 +264,7 @@ class SpectralPathRegressor:
             self.pr_list_,
             self.n_features_in_
         )
-        
+
         # Compute feature importance from final model
         final_importance = self._compute_feature_importance_from_model()
 
@@ -285,6 +291,15 @@ class SpectralPathRegressor:
         return self
 
     def predict(self, X: Array) -> Array:
+        """
+        Predict target values for input samples.
+
+        Args:
+            X (Array): Input samples with shape (n_samples, n_features).
+
+        Returns:
+            Predicted target values with shape (n_samples,).
+        """
         self._check_fitted()
         X = np.asarray(X)
         if X.ndim != 2:
@@ -299,35 +314,47 @@ class SpectralPathRegressor:
         theta = self.transformer_.transform(X)
 
         # Use cached structures for speed
+        self.pr_list_ = cast(List[PR], self.pr_list_)
+        self.coef_ = cast(Array, self.coef_)
         yhat = self._streamed_predict_from_struct(
             theta, self.pr_list_, self.coef_, self.p_mat_, self.r_arr_
         )
         return yhat
 
     def score(self, X: Array, y: Array) -> float:
+        """
+        Return the R^2 score on the given data.
+
+        Args:
+            X (Array): Input samples with shape (n_samples, n_features).
+            y (Array): True targets with shape (n_samples,).
+
+        Returns:
+            R^2 score as a float.
+        """
         y = np.asarray(y, dtype=float).ravel()
         yhat = self.predict(X)
         return float(r2_score(y, yhat))
-    
+
     def _compute_feature_importance_from_model(self) -> Array | None:
         """Compute feature importance from learned coefficients."""
         if self.selected_indices_ is None or self.coef_ is None:
             return None
-        
-        D = self.n_features_in_
+
+        D = cast(int, self.n_features_in_)
         importance = np.zeros(D, dtype=float)
-        
+
         # Skip intercept (index 0)
         for idx, m in enumerate(self.selected_indices_):
             coef_val = abs(self.coef_[idx + 1])  # +1 for intercept
             for j, m_j in enumerate(m):
                 if m_j != 0:
                     importance[j] += coef_val * abs(m_j)
-        
+
         # Normalize
         if importance.sum() > 0:
             importance = importance / importance.sum()
-        
+
         return importance
 
     def _balanced_compositions(self, L: int, r: int) -> List[List[int]]:
@@ -349,25 +376,25 @@ class SpectralPathRegressor:
         return sorted(comps, key=key)
 
     def _r_sparse_stream(
-        self, 
-        D: int, 
-        r: int, 
-        L_max: int | None,
+        self,
+        D: int,
+        r: int,
+        l_max: int | None,
         feature_importance: Array | None = None
-    ) -> Iterable[MVec]:
+    ) -> Iterator[MVec]:
         """Generate k-sparse paths, optionally prioritizing high-importance features."""
         if feature_importance is not None and self.use_importance_ordering:
             # Sort features by importance (descending)
             sorted_feats = np.argsort(-feature_importance)
         else:
             sorted_feats = np.arange(D)
-        
+
         L = 1
-        while L_max is None or L <= L_max:
+        while l_max is None or L <= l_max:
             for comp in self._balanced_compositions(L, r):
                 for S in combinations(sorted_feats, r):
                     m = [0] * D
-                    for idx, val in zip(S, comp):
+                    for idx, val in zip(S, comp, strict=True):
                         m[idx] = val
                     yield tuple(m)
             L += 1
@@ -481,8 +508,6 @@ class SpectralPathRegressor:
 
         return yhat
 
-    # ------------------- Final λ selection on fixed dictionary -------------------
-
     def _select_lambda_from_gram(
         self,
         G_tr: Array,
@@ -533,39 +558,39 @@ class SpectralPathRegressor:
 
         return float(best_lam)
 
-    # ------------------- Greedy selection (IMPROVED with early stopping) -------------
-
     def _greedy_k_mix_cos_incremental(
         self,
         theta_tr: Array, y_tr: Array,
         theta_val: Array, y_val: Array,
         D: int,
-    ) -> Tuple[List[MVec], float, List[Tuple[int, int, float, float]], Array, Array, bool]:
-        """
-        Improved greedy selection with:
-        - Early stopping when validation performance plateaus
-        - Adaptive block sizing
-        - Feature importance-based path ordering
-        """
+    ) -> Tuple[
+        List[MVec],
+        float,
+        List[Tuple[int, int, float, float]],
+        Array,
+        Array,
+        bool
+    ]:
+        """Greedily select k-sparse path features."""
         gens = {
             k: self._r_sparse_stream(
                 D,
                 k,
-                L_max=self.L_max,
+                l_max=self.l_max,
                 feature_importance=self.feature_importance_
-            ) 
+            )
             for k in self.k_values
         }
 
         selected: List[MVec] = []
         history: List[Tuple[int, int, float, float]] = []
         lambda_star: float | None = None
-        
+
         # Early stopping trackers
         best_val_overall = -1e18
         no_improve_count = 0
         stopped_early = False
-        
+
         # Adaptive block size
         current_block_size = self.block_size
 
@@ -607,7 +632,7 @@ class SpectralPathRegressor:
                 p_mat_blk, r_arr_blk = _pr_list_to_arrays(pr_blk, D)
                 cand_struct[k] = (pr_blk, p_mat_blk, r_arr_blk)
 
-            # Allocate accumulators per candidate: C (M_old x Qnew), Gnew (Qnew x Qnew), bnew (Qnew)
+            # Allocate accumulators per candidate
             C_map: Dict[int, Array] = {}
             Gnew_map: Dict[int, Array] = {}
             bnew_map: Dict[int, Array] = {}
@@ -665,7 +690,10 @@ class SpectralPathRegressor:
                 # Solve (possibly with lambda sweep on first commit)
                 if lambda_star is None:
                     best_r2_this = -1e18
-                    best_lam_this = float(self.lambda_grid[0]) if self.lambda_grid else 0.0
+                    if self.lambda_grid:
+                        best_lam_this = float(self.lambda_grid[0])
+                    else:
+                        best_lam_this = 0.0
                     # Precompute validation structures once for this trial dict
                     trial_indices = selected + blk
                     pr_trial = _group_by_primitive(trial_indices)
@@ -677,7 +705,9 @@ class SpectralPathRegressor:
                     if self.normalize_columns:
                         s_trial = self._column_scales_from_gram(G_trial)
                         inv_s_trial = 1.0 / s_trial
-                        Gs_trial = (inv_s_trial[:, None] * G_trial) * inv_s_trial[None, :]
+                        Gs_trial = (
+                            (inv_s_trial[:, None] * G_trial) * inv_s_trial[None, :]
+                        )
                         bs_trial = inv_s_trial * b_trial
                         evals_trial, U_trial = np.linalg.eigh(Gs_trial)
 
@@ -717,10 +747,11 @@ class SpectralPathRegressor:
                     trial_indices = selected + blk
                     pr_trial = _group_by_primitive(trial_indices)
                     p_mat_trial, r_arr_trial = _pr_list_to_arrays(
-                        pr_trial,
-                        theta_val.shape[1]
+                        pr_trial, theta_val.shape[1]
                     )
-                    w = self._solve_ridge_from_gram(G_trial, b_trial, float(lambda_star))
+                    w = self._solve_ridge_from_gram(
+                        G_trial, b_trial, float(lambda_star)
+                    )
                     y_val_hat = self._streamed_predict_from_struct(
                         theta_val, pr_trial, w, p_mat_trial, r_arr_trial
                     )
@@ -748,17 +779,21 @@ class SpectralPathRegressor:
             if best_val > best_val_overall + self.early_stopping_tol:
                 best_val_overall = best_val
                 no_improve_count = 0
-                
+
                 # Increase block size if doing well
                 if self.adaptive_block_size and current_block_size < self.block_size:
                     current_block_size = min(self.block_size, current_block_size + 1)
             else:
                 no_improve_count += 1
-                
+
                 # Decrease block size if plateauing
-                if self.adaptive_block_size and current_block_size > self.min_block_size:
-                    current_block_size = max(self.min_block_size, current_block_size - 1)
-                
+                if (
+                    self.adaptive_block_size and
+                    current_block_size > self.min_block_size):
+                    current_block_size = max(
+                        self.min_block_size, current_block_size - 1
+                    )
+
                 if no_improve_count >= self.early_stopping_patience:
                     if self.verbose:
                         print(
@@ -786,5 +821,12 @@ class SpectralPathRegressor:
     # ------------------- Misc -------------------
 
     def _check_fitted(self) -> None:
-        if not self.is_fitted_ or self.coef_ is None or self.selected_indices_ is None:
+        if any([
+            not self.is_fitted_,
+            self.coef_ is None,
+            self.selected_indices_ is None,
+            self.pr_list_ is None,
+            self.p_mat_ is None,
+            self.r_arr_ is None,
+        ]):
             raise RuntimeError("Model is not fitted yet. Call fit(X, y) first.")

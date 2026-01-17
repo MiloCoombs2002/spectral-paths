@@ -1,11 +1,12 @@
-from spectral_paths.model import SpectralPathRegressor
+"""Example module showing model usage with an OpenML dataset."""
+import time
 
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import r2_score, mean_squared_error
-import time
 from sklearn.datasets import fetch_openml
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
 
+from spectral_paths.model import SpectralPathRegressor
 
 X, y = fetch_openml(
     name="weather_ankara",
@@ -16,7 +17,7 @@ X, y = fetch_openml(
 )
 
 # Ensure target is float and 1D
-y = y.astype(float).ravel()
+y = np.asarray(y, dtype=float).ravel()
 
 # Train / test split
 X_tr, X_te, y_tr, y_te = train_test_split(
@@ -30,7 +31,7 @@ if __name__ == "__main__":
         total_cols=40*D, # 4 * D,
         block_size=1 * D,
         lambda_grid=list(np.logspace(-5, -1, 25)),
-        L_max=None,
+        l_max=None,
         scaler_type="standard_percentile_minmax",
         bound_percentiles=(2.0, 98.0),
         batch_rows=2048,
@@ -52,7 +53,7 @@ if __name__ == "__main__":
     t0 = time.perf_counter()
     mdl.fit(X_tr, y_tr)
     t1 = time.perf_counter()
-    
+
     print(f"\nTotal training time: {t1-t0:.3f}s")
 
     yhat = mdl.predict(X_te)

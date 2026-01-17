@@ -1,29 +1,27 @@
-[project]
+[tool.poetry]
 name = "spectral-paths"
 version = "0.1.0"
 description = ""
-authors = [
-    {name = "Milo Coombs2002",email = "milo.coombs7@gmail.com"}
-]
+authors = ["Milo Coombs2002 <milo.coombs7@gmail.com>"]
 readme = "README.md"
-requires-python = ">=3.12,<4.0"
-dependencies = [
-    "numpy (<2.4)",
-    "numba (>=0.63.1,<0.64.0)",
-    "scikit-learn (>=1.8.0,<2.0.0)"
-]
 
+[tool.poetry.dependencies]
+python = ">=3.12,<4.0"
+numpy = "<2.4"
+numba = ">=0.63.1,<0.64.0"
+scikit-learn = ">=1.8.0,<2.0.0"
+openml = "^0.15.1"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=9.0.2,<10.0.0"
+ruff = ">=0.14.11,<0.15.0"
+mypy = "^1.19.1"
 
 [build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
+requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
 
-[dependency-groups]
-dev = [
-    "pytest (>=9.0.2,<10.0.0)",
-    "ruff (>=0.14.11,<0.15.0)"
-]
-
+# You can keep your mypy and ruff sections as they are
 [tool.mypy]
 ignore_missing_imports = true
 
@@ -36,7 +34,8 @@ follow_imports = "skip"
 line-length = 88
 
 [tool.ruff.lint]
-select = ["E"]  # includes E501 (line too long)
+select = ["E","W", "F", "I", "B", "C4", "N", "D", "D213"]
+ignore = ["D212", "N803", "N806", "B023"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
