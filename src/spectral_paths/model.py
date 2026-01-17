@@ -20,7 +20,7 @@ from spectral_paths.utils.helpers import (
 )
 
 
-class SpectralPathRegressorCosineOnly:
+class SpectralPathRegressor:
     """
     Improved Spectral Path Regressor with:
     - Parallel feature computation
@@ -168,7 +168,7 @@ class SpectralPathRegressorCosineOnly:
         *,
         X_val: Array | None = None,
         y_val: Array | None = None,
-    ) -> "SpectralPathRegressorCosineOnly":
+    ) -> "SpectralPathRegressor":
         """Fit the model."""
         X = np.asarray(X)
         y = np.asarray(y, dtype=float).ravel()
@@ -330,8 +330,6 @@ class SpectralPathRegressorCosineOnly:
         
         return importance
 
-    # ------------------- Enumerators (IMPROVED) -------------------
-
     def _balanced_compositions(self, L: int, r: int) -> List[List[int]]:
         comps: List[List[int]] = []
 
@@ -430,7 +428,7 @@ class SpectralPathRegressorCosineOnly:
             y: Array,
             indices_nonzero: Sequence[MVec]
         ) -> Tuple[Array, Array]:
-        pr_list, _ = _group_by_primitive(indices_nonzero)
+        pr_list = _group_by_primitive(indices_nonzero)
         p_mat, r_arr = _pr_list_to_arrays(pr_list, theta.shape[1])
         M = 1 + len(pr_list)
         G = np.zeros((M, M), dtype=float)
@@ -598,22 +596,22 @@ class SpectralPathRegressorCosineOnly:
                 break
 
             # Structures for current dictionary (train + val prediction)
-            pr_old, pmax_old = _group_by_primitive(selected)
+            pr_old = _group_by_primitive(selected)
             p_mat_old, r_arr_old = _pr_list_to_arrays(pr_old, D)
             M_old = 1 + len(pr_old)
 
             # Structures for each candidate block
-            cand_struct: Dict[int, Tuple[List[PR], Dict[PVec, int], Array, Array]] = {}
+            cand_struct: Dict[int, Tuple[List[PR], Array, Array]] = {}
             for k, blk in candidates.items():
-                pr_blk, pmax_blk = _group_by_primitive(blk)
+                pr_blk = _group_by_primitive(blk)
                 p_mat_blk, r_arr_blk = _pr_list_to_arrays(pr_blk, D)
-                cand_struct[k] = (pr_blk, pmax_blk, p_mat_blk, r_arr_blk)
+                cand_struct[k] = (pr_blk, p_mat_blk, r_arr_blk)
 
             # Allocate accumulators per candidate: C (M_old x Qnew), Gnew (Qnew x Qnew), bnew (Qnew)
             C_map: Dict[int, Array] = {}
             Gnew_map: Dict[int, Array] = {}
             bnew_map: Dict[int, Array] = {}
-            for k, (pr_blk, _pmax_blk, _p_mat_blk, _r_arr_blk) in cand_struct.items():
+            for k, (pr_blk, _p_mat_blk, _r_arr_blk) in cand_struct.items():
                 Qnew = len(pr_blk)
                 C_map[k] = np.zeros((M_old, Qnew), dtype=float)
                 Gnew_map[k] = np.zeros((Qnew, Qnew), dtype=float)
@@ -636,7 +634,7 @@ class SpectralPathRegressorCosineOnly:
                     True,
                 )  # (B, M_old)
 
-                for k, (_pr_blk, _pmax_blk, p_mat_blk, r_arr_blk) in cand_struct.items():
+                for k, (_pr_blk, p_mat_blk, r_arr_blk) in cand_struct.items():
                     Phi_new_b = _build_features_numba(
                         theta_b,
                         p_mat_blk,

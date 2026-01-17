@@ -165,7 +165,7 @@ def _group_by_primitive(
         indices_nonzero (Sequence[MVec]): Collection of nonzero frequency vectors.
 
     Returns:
-        Tuple[List[PR], Dict[PVec, int]]: A list of (primitive, order) pairs
+        List[PR]: A list of (primitive, order) pairs
         corresponding to the input vectors, and a mapping from each primitive
         direction to the maximum harmonic order observed along that ray.
     """
