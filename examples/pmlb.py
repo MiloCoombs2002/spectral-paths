@@ -1,53 +1,41 @@
-"""Example module showing model usage with OpenML datasets."""
+"""Example module showing model usage with UCI datasets."""
+import sys
 import time
-from typing import TypedDict
+from pathlib import Path
 
 import numpy as np
-from sklearn.datasets import fetch_openml
 from sklearn.metrics import r2_score
 from sklearn.model_selection import train_test_split
 
 from spectral_paths.model import SpectralPathRegressor
 
-verbose = True
+# Avoid shadowing the third-party `pmlb` package with this file's name.
+_examples_dir = Path(__file__).resolve().parent
+if str(_examples_dir) in sys.path:
+    sys.path.remove(str(_examples_dir))
+from pmlb import fetch_data  # type: ignore[attr-defined, E402]  # noqa: E402
+
+verbose = False
 extra_verbose = False
 
-class DatasetSpec(TypedDict):
-    """DatasetSpec schema."""
-    name: str
-    openml_name: str
-    version: int
 
-datasets: list[DatasetSpec] = [
-    {"name": "Concrete Slump", "openml_name": "slump", "version": 2},
-    {"name": "Yacht Hydrodynamics", "openml_name": "yacht_hydrodynamics", "version": 1},
-    {
-        "name": "Cancer Drug Response",
-        "openml_name": "Cancer_Drug_Response",
-        "version": 1
-    },
-    {"name": "Aquatic Toxicity", "openml_name": "qsar_aquatic_toxicity", "version": 1},
-    {"name": "Izmir Weather", "openml_name": "weather_izmir", "version": 1},
-    {"name": "Ankara Weather", "openml_name": "weather_ankara", "version": 1},
+datasets: list[dict[str, str]] = [
+    {"name": "Echo Cardiogram", "pmlb_name": "1199_BNG_echoMonths"},
+    {"name": "Wind Speed", "pmlb_name": "503_wind"},
+    {"name": "CPU Utilisation", "pmlb_name": "197_cpu_act"}
 ]
+
 
 if __name__ == "__main__":
     for dataset in datasets:
 
         print(f"Dataset: {dataset["name"]}")
-        X, y = fetch_openml(
-            name=dataset["openml_name"],
-            version=dataset["version"],
-            as_frame=False,
-            parser="auto",
-            return_X_y=True,
-        )
+        # Fetch data as a pandas DataFrame
+        df = fetch_data(dataset["pmlb_name"], return_X_y=False)
 
-        # Ensure target is float and 1D
-        if dataset["openml_name"] == "slump":
-            y = np.asarray(y, dtype=float)[:, 0].ravel()
-        else:
-            y = np.asarray(y, dtype=float).ravel()
+        # Convention: last column is the target
+        X = df.iloc[:, :-1].values  # type: ignore[assignment]
+        y = df.iloc[:, -1].values.astype(float).ravel()  # type: ignore[assignment]
 
         # Train / test split
         X_tr, X_te, y_tr, y_te = train_test_split(
@@ -57,7 +45,7 @@ if __name__ == "__main__":
         D = X.shape[1]
 
         mdl = SpectralPathRegressor(
-            total_cols=30*D if dataset["openml_name"] !="Cancer_Drug_Response" else 3*D,
+            total_cols=10*D,
             block_size=1 * D,
             lambda_grid=list(np.logspace(-5, -1, 25)),
             l_max=None,
@@ -70,8 +58,7 @@ if __name__ == "__main__":
             final_lambda_refit=True,
             normalize_columns=True,
             normalize_intercept=False,
-            k_values=(1,2,3,4),
-            # New improved parameters
+            k_values=(1,2,3),
             early_stopping_patience=5,
             early_stopping_tol= 1e-5,
             adaptive_block_size=True,
