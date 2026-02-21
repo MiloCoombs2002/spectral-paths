@@ -13,7 +13,7 @@ import numpy as np
 from sklearn.metrics import r2_score
 from sklearn.model_selection import train_test_split
 
-from spectral_paths.schemas import FitReport
+from spectral_paths.schemas import FitReport, Stats
 from spectral_paths.types import PR, Array, MVec, ScalerType
 from spectral_paths.utils.helpers import (
     _build_features_numba,
@@ -21,6 +21,7 @@ from spectral_paths.utils.helpers import (
     _group_by_primitive,
     _metrics,
     _pr_list_to_arrays,
+    check_dimensions,
 )
 from spectral_paths.utils.preprocessing import AngularTransformer
 
@@ -36,7 +37,7 @@ class SpectralPathRegressor:
     def __init__(
         self,
         *,
-        total_cols: int,
+        max_paths: int,
         block_size: int,
         lambda_grid: Sequence[float] = (0.01, 0.1, 1.0),
         l_max: int | None = None,
@@ -66,7 +67,7 @@ class SpectralPathRegressor:
         Initialise a spectral path regression model.
 
         Parameters:
-            total_cols (int): Total number of input features (after preprocessing).
+            max_paths (int): Total number of input features (after preprocessing).
             block_size (int): Number of spectral paths added per greedy expansion step.
             lambda_grid (Sequence[float]): Candidate ridge regularisation strengths to
                 evaluate during validation-based selection.
@@ -106,7 +107,7 @@ class SpectralPathRegressor:
             use_importance_ordering (bool): Whether to prioritise candidate paths using
                 univariate importanceheuristics.
         """
-        self.total_cols = int(total_cols)
+        self.max_paths = int(max_paths)
         self.block_size = int(block_size)
         self.lambda_grid = list(lambda_grid)
         self.l_max = l_max
@@ -133,7 +134,7 @@ class SpectralPathRegressor:
         self.is_fitted_: bool = False
         self.n_features_in_: int | None = None
 
-        self.selected_indices_: List[MVec] | None = None
+        self.selected_paths_: List[MVec] | None = None
         self.pr_list_: List[PR] | None = None
         self.lambda_: float | None = None
         self.coef_: Array | None = None
@@ -163,29 +164,16 @@ class SpectralPathRegressor:
             eps=float(getattr(self, "eps_scaler", self.eps_col_norm)),
         )
 
-    def fit(
-            self,
-            X: Array,
-            y: Array,
-            *,
-            X_val: Array | None = None,
-            y_val: Array | None = None
-    ) -> "SpectralPathRegressor":
-        """Fit the model."""
-        X = np.asarray(X)
-        y = np.asarray(y, dtype=float).ravel()
-
-        if X.ndim != 2:
-            raise ValueError(f"X must be 2D, got shape {X.shape}")
-        if X.shape[0] != y.shape[0]:
-            raise ValueError(f"X rows {X.shape[0]} != y rows {y.shape[0]}")
-
-        self.n_features_in_ = X.shape[1]
-
-        # Split train/val if not provided
+    def prepare_train_val_split(
+        self, X: Array, y: Array, X_val: Array | None, y_val: Array | None
+    ) -> tuple[Array, Array, Array, Array]:
+        """Prepares training and validation data."""
         if X_val is None or y_val is None:
-            X_tr, X_val2, y_tr, y_val2 = train_test_split(
-                X, y, test_size=self.val_size, random_state=self.random_state
+            X_tr, X_val2, y_tr, y_val2 = cast(
+                tuple[Array, Array, Array, Array],
+                train_test_split(
+                    X, y, test_size=self.val_size, random_state=self.random_state
+                ),
             )
             X_val, y_val = X_val2, y_val2
         else:
@@ -197,95 +185,94 @@ class SpectralPathRegressor:
             if X_val.shape[0] != y_val.shape[0]:
                 raise ValueError("X_val rows must match y_val length.")
 
-        # Assertions for type checking
-        assert X_val is not None
-        assert y_val is not None
+        return X_tr, y_tr, X_val, y_val
 
-        # Fit transform parameters on training only
+    def _transform_data(self, X_tr: Array, X_val: Array) -> tuple[Array, Array]:
+        """Initalise transformer. Scale, and angualr transform X_tr, and X_val."""
         self.transformer_ = self._make_transformer()
         theta_tr = self.transformer_.fit_transform(X_tr)
         theta_val = self.transformer_.transform(X_val)
 
-        D = theta_tr.shape[1]
+        return theta_tr, theta_val
 
-        # Compute initial feature importance for smart path ordering
+    def _compute_feature_importance(self, theta_tr: Array, y_tr: Array) -> None:
+        """If use_importance_ordering, compute_initial feature importance."""
         if self.use_importance_ordering:
-            self.feature_importance_ = _compute_initial_importance(
-                theta_tr,
-                y_tr,
-                D
-            )
+            self.feature_importance_ = _compute_initial_importance(theta_tr, y_tr)
         else:
             self.feature_importance_ = None
 
-        # 1) Greedy dictionary selection using incremental Gram on training split
-        t0 = time.perf_counter()
-        (
-            selected_indices,
-            lambda_star_greedy,
-            history,
-            G_tr_final,
-            b_tr_final,
-            stopped_early
-        ) = self._greedy_k_mix_cos_incremental(theta_tr, y_tr, theta_val, y_val, D)
+    def _save_learned_state(
+        self, paths: List[MVec], lambda_star: float, coeffs: Array
+    ) -> None:
+        """Save indices, lambda* and coefficents to self."""
+        self.selected_paths_ = paths
+        self.lambda_ = lambda_star
+        self.coef_ = coeffs.astype(float, copy=False)
 
-        t1 = time.perf_counter()
+    def _cache_ray_structures(self, indices: List[MVec]) -> None:
+        """Cache ray structures in self to improve inference speed."""
+        self.pr_list_ = _group_by_primitive(indices)
+        self.p_mat_, self.r_arr_ = _pr_list_to_arrays(self.pr_list_)
 
-        # 2) Optional: re-sweep lambda for FINAL dictionary (fit on train, score on val)
-        if self.final_lambda_refit and len(self.lambda_grid) > 0:
-            lambda_star_final = self._select_lambda_from_gram(
-                G_tr_final,
-                b_tr_final,
-                theta_val,
-                y_val,
-                selected_indices,
-                self.lambda_grid
-            )
-        else:
-            lambda_star_final = float(lambda_star_greedy)
-
-        # 3) Final fit on (train + val) using lambda_star_final
-        theta_all = np.vstack([theta_tr, theta_val])
-        y_all = np.concatenate([y_tr, y_val])
-
+    def _calculate_coeffs(
+        self, theta: Array, y: Array, paths: List[MVec], lambda_star: float
+    ) -> tuple[float, Array]:
+        """Compute normal equation, solve it, return coefficients + time taken."""
         t2 = time.perf_counter()
-        G_all, b_all = self._streamed_gram_cos(theta_all, y_all, selected_indices)
-        w_star = self._solve_ridge_from_gram(G_all, b_all, float(lambda_star_final))
+        gram_matrix, target_col = self._compute_normal_eqn(theta, y, paths)
+        coefficients = self._solve_normal_eqn(gram_matrix, target_col, lambda_star)
         t3 = time.perf_counter()
+        return t3-t2, coefficients
 
-        # Save learned state
-        self.selected_indices_ = selected_indices
-        self.lambda_ = float(lambda_star_final)
-        self.coef_ = w_star.astype(float, copy=False)
+    def fit(
+        self,
+        X: Array,
+        y: Array,
+        *,
+        X_val: Array | None = None,
+        y_val: Array | None = None
+    ) -> "SpectralPathRegressor":
+        """Fit the model."""
+        # Preparation
+        X = np.asarray(X)
+        y = np.asarray(y, dtype=float).ravel()
+        check_dimensions(X,y)
+        self.n_features_in_ = X.shape[1]
 
-        # Cache ray structures for predict
-        self.pr_list_ = _group_by_primitive(self.selected_indices_)
-        self.p_mat_, self.r_arr_ = _pr_list_to_arrays(
-            self.pr_list_,
-            self.n_features_in_
+        # Train - val split
+        X_tr, y_tr, X_val, y_val = self.prepare_train_val_split(X,y,X_val,y_val)
+
+        # Scale & transform
+        theta_tr, theta_val = self._transform_data(X_tr, X_val)
+
+        self._compute_feature_importance(theta_tr, y_tr)
+
+        paths, lambda_star, stats = self._select_paths_and_lambda(
+            theta_tr, y_tr, theta_val, y_val
         )
 
-        # Compute feature importance from final model
+        theta_all = cast(Array, np.vstack([theta_tr, theta_val]))
+        y_all = cast(Array, np.concatenate([y_tr, y_val]))
+
+        solve_time, coefficients = self._calculate_coeffs(
+            theta_all, y_all, paths, lambda_star
+        )
+
+        self._save_learned_state(paths, lambda_star, coefficients)
+        self._cache_ray_structures(paths)
+
         final_importance = self._compute_feature_importance_from_model()
 
         self.fit_report_ = FitReport(
-            lambda_star=float(lambda_star_final),
-            selected_count=len(selected_indices),
-            greedy_time_sec=float(t1 - t0),
-            final_solve_time_sec=float(t3 - t2),
-            history=history,
-            stopped_early=stopped_early,
+            lambda_star=lambda_star,
+            selected_count=len(paths),
+            greedy_time_sec=stats.time_taken,
+            final_solve_time_sec=solve_time,
+            history=stats.history,
+            stopped_early=stats.stopped_early,
             feature_importance=final_importance,
         )
-
-        if self.verbose and self.final_lambda_refit:
-            if float(lambda_star_final) != float(lambda_star_greedy):
-                print(
-                    f"[Final λ sweep] greedy λ*={lambda_star_greedy} "
-                    f"→ final λ*={lambda_star_final}"
-                )
-            else:
-                print(f"[Final λ sweep] final λ*={lambda_star_final} (same as greedy)")
 
         self.is_fitted_ = True
         return self
@@ -322,34 +309,32 @@ class SpectralPathRegressor:
         return yhat
 
     def score(self, X: Array, y: Array) -> float:
-        """
-        Return the R^2 score on the given data.
-
-        Args:
-            X (Array): Input samples with shape (n_samples, n_features).
-            y (Array): True targets with shape (n_samples,).
-
-        Returns:
-            R^2 score as a float.
-        """
+        """Return the R^2 score on the given data."""
         y = np.asarray(y, dtype=float).ravel()
         yhat = self.predict(X)
-        return float(r2_score(y, yhat))
+        return r2_score(y, yhat)
 
-    def _compute_feature_importance_from_model(self) -> Array | None:
-        """Compute feature importance from learned coefficients."""
-        if self.selected_indices_ is None or self.coef_ is None:
-            return None
+    def _compute_feature_importance_from_model(self) -> Array:
+        """
+        Compute feature importance from selected paths & coefficients.
 
-        D = cast(int, self.n_features_in_)
-        importance = np.zeros(D, dtype=float)
+        Returns an Array of size D. Each elemnt is between 1 and 0 and is the
+        importance of a feature.
+        """
+        if (
+            self.selected_paths_ is None or self.coef_ is None or
+            self.n_features_in_ is None
+        ):
+            raise ValueError("Selected indices or coeffs or n_features are None")
 
-        # Skip intercept (index 0)
-        for idx, m in enumerate(self.selected_indices_):
-            coef_val = abs(self.coef_[idx + 1])  # +1 for intercept
-            for j, m_j in enumerate(m):
+        importance = np.zeros(self.n_features_in_, dtype=float)
+
+        # Loop through paths
+        for idx, path in enumerate(self.selected_paths_):
+            coefficient = abs(self.coef_[idx + 1])  # +1 for intercept
+            for j, m_j in enumerate(path):
                 if m_j != 0:
-                    importance[j] += coef_val * abs(m_j)
+                    importance[j] += coefficient * abs(m_j)
 
         # Normalize
         if importance.sum() > 0:
@@ -358,7 +343,7 @@ class SpectralPathRegressor:
         return importance
 
     def _balanced_compositions(self, L: int, r: int) -> List[List[int]]:
-        comps: List[List[int]] = []
+        comps = []
 
         def rec(prefix: List[int], remaining: int, slots: int) -> None:
             if slots == 1:
@@ -375,24 +360,21 @@ class SpectralPathRegressor:
 
         return sorted(comps, key=key)
 
-    def _r_sparse_stream(
-        self,
-        D: int,
-        r: int,
-        l_max: int | None,
-        feature_importance: Array | None = None
-    ) -> Iterator[MVec]:
+    def _path_generator(self, k: int) -> Iterator[MVec]:
         """Generate k-sparse paths, optionally prioritizing high-importance features."""
-        if feature_importance is not None and self.use_importance_ordering:
+        D = self.n_features_in_
+        if D is None:
+            raise ValueError("D is not set yet, cannot create path generators.")
+        if self.feature_importance_ is not None and self.use_importance_ordering:
             # Sort features by importance (descending)
-            sorted_feats = np.argsort(-feature_importance)
+            sorted_feats = np.argsort(-self.feature_importance_)
         else:
             sorted_feats = np.arange(D)
 
         L = 1
-        while l_max is None or L <= l_max:
-            for comp in self._balanced_compositions(L, r):
-                for S in combinations(sorted_feats, r):
+        while self.l_max is None or L <= self.l_max:
+            for comp in self._balanced_compositions(L, k):
+                for S in combinations(sorted_feats, k):
                     m = [0] * D
                     for idx, val in zip(S, comp, strict=True):
                         m[idx] = val
@@ -409,7 +391,7 @@ class SpectralPathRegressor:
             s[0] = 1.0
         return s
 
-    def _solve_ridge_from_gram(self, G: Array, b: Array, lam: float) -> Array:
+    def _solve_normal_eqn(self, G: Array, b: Array, lam: float) -> Array:
         """
         Solve ridge from Gram, optionally with implicit column normalization.
 
@@ -418,57 +400,48 @@ class SpectralPathRegressor:
             Solve (G_tilde + lam I) w_tilde = b_tilde
             Return w = (1/s) * w_tilde (so predictions use original Phi).
         """
-        lam_f = float(lam)
-
         if self.normalize_columns:
             s = self._column_scales_from_gram(G)
             inv_s = 1.0 / s
-            Gs = (inv_s[:, None] * G) * inv_s[None, :]
-            bs = inv_s * b
+            G = (inv_s[:, None] * G) * inv_s[None, :]
+            b = inv_s * b
 
-            evals, U = np.linalg.eigh(Gs)
-            w_tilde = self._solve_with_cached_eigs(evals, U, bs, lam_f)
+            evals, U = np.linalg.eigh(G)
+            w_tilde = self._solve_with_cached_eigs(evals, U, b, lam)
 
             w = inv_s * w_tilde
             return w
 
         evals, U = np.linalg.eigh(G)
-        w = self._solve_with_cached_eigs(evals, U, b, lam_f)
+        w = self._solve_with_cached_eigs(evals, U, b, lam)
         return w
 
     def _solve_with_cached_eigs(
-            self,
-            evals: Array,
-            U: Array,
-            b: Array,
-            lam: float
+        self, evals: Array, U: Array, b: Array, lam: float
     ) -> Array:
         UTb = U.T @ b
         inv_diag = 1.0 / (evals + lam)
         return U @ (inv_diag * UTb)
 
-    # ------------------- Streamed Gram / predict -------------------
-
-    def _streamed_gram_cos(
-            self,
-            theta: Array,
-            y: Array,
-            indices_nonzero: Sequence[MVec]
-        ) -> Tuple[Array, Array]:
-        pr_list = _group_by_primitive(indices_nonzero)
-        p_mat, r_arr = _pr_list_to_arrays(pr_list, theta.shape[1])
+    def _compute_normal_eqn(
+        self, theta: Array, y: Array, paths: Sequence[MVec]
+    ) -> Tuple[Array, Array]:
+        pr_list = _group_by_primitive(paths)
+        PathMatrix, Orders = _pr_list_to_arrays(pr_list)
         M = 1 + len(pr_list)
+
+        # Initialize Gram matrix and target cold as empty arrays
         G = np.zeros((M, M), dtype=float)
         b = np.zeros(M, dtype=float)
 
         N = theta.shape[0]
         for start in range(0, N, self.batch_rows):
             end = min(N, start + self.batch_rows)
-            theta_b = theta[start:end].astype(
+            theta_batchatch = theta[start:end].astype(
                 np.float32 if self.use_float32 else np.float64,
                 copy=False
             )
-            Phi_b = _build_features_numba(theta_b, p_mat, r_arr, True)
+            Phi_b = _build_features_numba(theta_batchatch, PathMatrix, Orders, True)
             y_b = y[start:end]
             G += Phi_b.T @ Phi_b
             b += Phi_b.T @ y_b
@@ -488,7 +461,7 @@ class SpectralPathRegressor:
                 p_mat = self.p_mat_
                 r_arr = self.r_arr_
             else:
-                p_mat, r_arr = _pr_list_to_arrays(pr_list, theta.shape[1])
+                p_mat, r_arr = _pr_list_to_arrays(pr_list)
 
         N = theta.shape[0]
         yhat = np.empty(N, dtype=float)
@@ -497,8 +470,7 @@ class SpectralPathRegressor:
             end = min(N, start + self.batch_rows)
             Phi_b = _build_features_numba(
                 theta[start:end].astype(
-                    np.float32 if self.use_float32 else np.float64,
-                    copy=False
+                    np.float32 if self.use_float32 else np.float64, copy=False
                 ),
                 p_mat,
                 r_arr,
@@ -515,14 +487,13 @@ class SpectralPathRegressor:
         theta_val: Array,
         y_val: Array,
         indices_nonzero: Sequence[MVec],
-        lambda_grid: Sequence[float],
     ) -> float:
         best_r2 = -1e18
-        best_lam = float(lambda_grid[0])
+        best_lam = float(self.lambda_grid[0])
 
         # Precompute structures once for validation prediction speed
         pr_list = _group_by_primitive(indices_nonzero)
-        p_mat, r_arr = _pr_list_to_arrays(pr_list, theta_val.shape[1])
+        p_mat, r_arr = _pr_list_to_arrays(pr_list)
 
         # Cache eigendecomp for lambda sweep
         if self.normalize_columns:
@@ -542,130 +513,76 @@ class SpectralPathRegressor:
             def solve_for_lambda(lam_val: float) -> Array:
                 return self._solve_with_cached_eigs(evals, U, b_tr, lam_val)
 
-        for lam in lambda_grid:
+        for lam in self.lambda_grid:
             w = solve_for_lambda(float(lam))
             y_val_hat = self._streamed_predict_from_struct(
-                theta_val,
-                pr_list,
-                w,
-                p_mat,
-                r_arr
+                theta_val, pr_list, w, p_mat, r_arr
             )
             _, r2v = _metrics(y_val, y_val_hat)
             if r2v > best_r2:
                 best_r2 = r2v
                 best_lam = float(lam)
 
-        return float(best_lam)
+        return best_lam
 
-    def _greedy_k_mix_cos_incremental(
-        self,
-        theta_tr: Array, y_tr: Array,
-        theta_val: Array, y_val: Array,
-        D: int,
-    ) -> Tuple[
-        List[MVec],
-        float,
-        List[Tuple[int, int, float, float]],
-        Array,
-        Array,
-        bool
-    ]:
+    def _select_paths_and_lambda(
+        self, theta_tr: Array, y_tr: Array, theta_val: Array, y_val: Array,
+    ) -> Tuple[List[MVec], float, Stats]:
         """Greedily select k-sparse path features."""
-        gens = {
-            k: self._r_sparse_stream(
-                D,
-                k,
-                l_max=self.l_max,
-                feature_importance=self.feature_importance_
-            )
-            for k in self.k_values
-        }
+        t0 = time.perf_counter()
 
-        selected: List[MVec] = []
+        # Set up
+        generators = {k: self._path_generator(k) for k in self.k_values}
+        selected_paths: List[MVec] = []
         history: List[Tuple[int, int, float, float]] = []
         lambda_star: float | None = None
-
-        # Early stopping trackers
         best_val_overall = -1e18
         no_improve_count = 0
         stopped_early = False
-
-        # Adaptive block size
         current_block_size = self.block_size
-
-        # Start with intercept-only on training split
-        Ntr = theta_tr.shape[0]
+        Ntr: int = theta_tr.shape[0]
         G_old = np.array([[float(Ntr)]], dtype=float)
         b_old = np.array([float(y_tr.sum())], dtype=float)
 
-        while len(selected) < self.total_cols:
-            remaining = self.total_cols - len(selected)
-            bs = min(current_block_size, remaining)
+        while len(selected_paths) < self.max_paths:
+            remaining = self.max_paths - len(selected_paths)
+            block_size = min(current_block_size, remaining)
 
-            # Propose blocks from each k
-            candidates: Dict[int, List[MVec]] = {}
-            for k in self.k_values:
-                blk: List[MVec] = []
-                for _ in range(bs):
-                    try:
-                        blk.append(next(gens[k]))
-                    except StopIteration:
-                        break
-                if blk:
-                    candidates[k] = blk
-
+            candidates = self._next_candidate_blocks(generators, block_size)
             if not candidates:
                 if self.verbose:
-                    print("All generators exhausted before reaching total_cols.")
+                    print("All generators exhausted before reaching max_paths.")
                 break
 
-            # Structures for current dictionary (train + val prediction)
-            pr_old = _group_by_primitive(selected)
-            p_mat_old, r_arr_old = _pr_list_to_arrays(pr_old, D)
+            pr_old = _group_by_primitive(selected_paths)
+            if not selected_paths:
+                p_mat_old = np.empty((0, theta_tr.shape[1]))
+                r_arr_old = np.empty((0,), dtype=np.int64)
+            else:
+                p_mat_old, r_arr_old = _pr_list_to_arrays(pr_old)
             M_old = 1 + len(pr_old)
 
-            # Structures for each candidate block
-            cand_struct: Dict[int, Tuple[List[PR], Array, Array]] = {}
-            for k, blk in candidates.items():
-                pr_blk = _group_by_primitive(blk)
-                p_mat_blk, r_arr_blk = _pr_list_to_arrays(pr_blk, D)
-                cand_struct[k] = (pr_blk, p_mat_blk, r_arr_blk)
-
-            # Allocate accumulators per candidate
-            C_map: Dict[int, Array] = {}
-            Gnew_map: Dict[int, Array] = {}
-            bnew_map: Dict[int, Array] = {}
-            for k, (pr_blk, _p_mat_blk, _r_arr_blk) in cand_struct.items():
-                Qnew = len(pr_blk)
-                C_map[k] = np.zeros((M_old, Qnew), dtype=float)
-                Gnew_map[k] = np.zeros((Qnew, Qnew), dtype=float)
-                bnew_map[k] = np.zeros(Qnew, dtype=float)
+            cand_struct, C_map, Gnew_map, bnew_map = self._init_candidate_evaluation(
+                candidates, M_old
+            )
 
             # Single streaming pass over TRAIN to compute candidate block stats
-            N = theta_tr.shape[0]
-            for start in range(0, N, self.batch_rows):
-                end = min(N, start + self.batch_rows)
+            for start in range(0, Ntr, self.batch_rows):
+                end = min(Ntr, start + self.batch_rows)
                 y_b = y_tr[start:end]
 
-                theta_b = theta_tr[start:end].astype(
+                theta_batch = theta_tr[start:end].astype(
                     np.float32 if self.use_float32 else np.float64,
                     copy=False
                 )
                 Phi_old_b = _build_features_numba(
-                    theta_b,
-                    p_mat_old,
-                    r_arr_old,
-                    True,
-                )  # (B, M_old)
+                    theta_batch, p_mat_old, r_arr_old, True
+                )
 
-                for k, (_pr_blk, p_mat_blk, r_arr_blk) in cand_struct.items():
+                for k, (p_mat_block, r_arr_block) in cand_struct.items():
                     Phi_new_b = _build_features_numba(
-                        theta_b,
-                        p_mat_blk,
-                        r_arr_blk,
-                        False,
-                    )  # (B, Qnew)
+                        theta_batch, p_mat_block, r_arr_block, False
+                    )
 
                     C_map[k] += Phi_old_b.T @ Phi_new_b
                     Gnew_map[k] += Phi_new_b.T @ Phi_new_b
@@ -673,18 +590,15 @@ class SpectralPathRegressor:
 
             # Evaluate candidates (solve on train using block Gram; score on val)
             best_val = -1e18
-            best_choice = None  # (k, blk, G_trial, b_trial, lam_used)
+            best_choice = None  # (k, block, G_trial, b_trial, lam_used)
 
-            for k, blk in candidates.items():
+            for k, block in candidates.items():
                 C = C_map[k]
                 Gnew = Gnew_map[k]
                 bnew = bnew_map[k]
 
                 # Build trial Gram/b
-                G_trial = np.block([
-                    [G_old, C],
-                    [C.T,  Gnew],
-                ])
+                G_trial = np.block([[G_old, C], [C.T,  Gnew]])
                 b_trial = np.concatenate([b_old, bnew])
 
                 # Solve (possibly with lambda sweep on first commit)
@@ -695,12 +609,9 @@ class SpectralPathRegressor:
                     else:
                         best_lam_this = 0.0
                     # Precompute validation structures once for this trial dict
-                    trial_indices = selected + blk
+                    trial_indices = selected_paths + block
                     pr_trial = _group_by_primitive(trial_indices)
-                    p_mat_trial, r_arr_trial = _pr_list_to_arrays(
-                        pr_trial,
-                        theta_val.shape[1]
-                    )
+                    p_mat_trial, r_arr_trial = _pr_list_to_arrays(pr_trial)
 
                     if self.normalize_columns:
                         s_trial = self._column_scales_from_gram(G_trial)
@@ -713,10 +624,7 @@ class SpectralPathRegressor:
 
                         def solve_for_lambda(lam_val: float) -> Array:
                             w_tilde = self._solve_with_cached_eigs(
-                                evals_trial,
-                                U_trial,
-                                bs_trial,
-                                lam_val
+                                evals_trial, U_trial, bs_trial, lam_val
                             )
                             return inv_s_trial * w_tilde
 
@@ -725,10 +633,7 @@ class SpectralPathRegressor:
 
                         def solve_for_lambda(lam_val: float) -> Array:
                             return self._solve_with_cached_eigs(
-                                evals_trial,
-                                U_trial,
-                                b_trial,
-                                lam_val
+                                evals_trial, U_trial, b_trial, lam_val
                             )
 
                     for lam in self.lambda_grid:
@@ -744,12 +649,10 @@ class SpectralPathRegressor:
                     cand_val = best_r2_this
                     cand_lam = float(best_lam_this)
                 else:
-                    trial_indices = selected + blk
+                    trial_indices = selected_paths + block
                     pr_trial = _group_by_primitive(trial_indices)
-                    p_mat_trial, r_arr_trial = _pr_list_to_arrays(
-                        pr_trial, theta_val.shape[1]
-                    )
-                    w = self._solve_ridge_from_gram(
+                    p_mat_trial, r_arr_trial = _pr_list_to_arrays(pr_trial)
+                    w = self._solve_normal_eqn(
                         G_trial, b_trial, float(lambda_star)
                     )
                     y_val_hat = self._streamed_predict_from_struct(
@@ -760,11 +663,11 @@ class SpectralPathRegressor:
 
                 if cand_val > best_val:
                     best_val = cand_val
-                    best_choice = (k, blk, G_trial, b_trial, cand_lam)
+                    best_choice = (k, block, G_trial, b_trial, cand_lam)
 
             # Commit best
-            k_win, blk_win, G_new_old, b_new_old, lam_win = best_choice  # type: ignore
-            selected = selected + blk_win
+            k_win, block_win, G_new_old, b_new_old, lam_win = best_choice  # type: ignore
+            selected_paths = selected_paths + block_win
             G_old = G_new_old
             b_old = b_new_old
 
@@ -772,7 +675,7 @@ class SpectralPathRegressor:
                 lambda_star = float(lam_win)
 
             history.append(
-                (int(k_win), int(len(blk_win)), float(lambda_star), float(best_val))
+                (int(k_win), int(len(block_win)), float(lambda_star), float(best_val))
             )
 
             # Early stopping check
@@ -798,33 +701,75 @@ class SpectralPathRegressor:
                     if self.verbose:
                         print(
                             f"[Early stopping] No improvement for "
-                            f"{self.early_stopping_patience} rounds at {len(selected)} "
-                            "paths"
+                            f"{self.early_stopping_patience} rounds at "
+                            f"{len(selected_paths)} paths"
                         )
                     stopped_early = True
                     break
 
             if self.verbose:
-                cols = len(selected)
+                cols = len(selected_paths)
                 print(
-                    f"[Greedy] Added k={k_win} block of {len(blk_win)} → total={cols} |"
-                    f" λ_used={lambda_star} | R²_val={best_val:0.4f} | "
+                    f"[Greedy] Added k={k_win} block of {len(block_win)} → total={cols}"
+                    f" | λ_used={lambda_star} | R²_val={best_val:0.4f} | "
                     f"block_size={current_block_size}"
                 )
 
         if lambda_star is None:
             lambda_star = float(self.lambda_grid[0]) if self.lambda_grid else 0.0
 
+        # Optional re-sweep
+        if self.final_lambda_refit and len(self.lambda_grid) > 0:
+            lambda_star = self._select_lambda_from_gram(
+                G_old, b_old, theta_val, y_val, selected_paths
+            )
+        t1 = time.perf_counter()
         # Return final training Gram/b for the selected dict (already in G_old/b_old)
-        return selected, float(lambda_star), history, G_old, b_old, stopped_early
+        stats = Stats(stopped_early=stopped_early, history=history, time_taken=t1-t0)
+        return selected_paths, float(lambda_star), stats
 
     # ------------------- Misc -------------------
+
+    def _next_candidate_blocks(
+        self, generators: Dict[int, Iterator[MVec]], block_size: int,
+    ) -> Dict[int, List[MVec]]:
+        candidates: Dict[int, List[MVec]] = {}
+        for k in self.k_values:
+            block: List[MVec] = []
+            for _ in range(block_size):
+                try:
+                    block.append(next(generators[k]))
+                except StopIteration:
+                    break
+            if block:
+                candidates[k] = block
+        return candidates
+
+    def _init_candidate_evaluation(
+        self, candidates: Dict[int, List[MVec]], M_old: int,
+    ) -> Tuple[
+            Dict[int, Tuple[Array, Array]],
+            Dict[int, Array], Dict[int, Array], Dict[int, Array]]:
+        cand_struct: Dict[int, Tuple[Array, Array]] = {}
+        C_map: Dict[int, Array] = {}
+        Gnew_map: Dict[int, Array] = {}
+        bnew_map: Dict[int, Array] = {}
+        for k, block in candidates.items():
+            pr_block = _group_by_primitive(block)
+            p_mat_block, r_arr_block = _pr_list_to_arrays(pr_block)
+            cand_struct[k] = (p_mat_block, r_arr_block)
+
+            Qnew = len(pr_block)
+            C_map[k] = np.zeros((M_old, Qnew), dtype=float)
+            Gnew_map[k] = np.zeros((Qnew, Qnew), dtype=float)
+            bnew_map[k] = np.zeros(Qnew, dtype=float)
+        return cand_struct, C_map, Gnew_map, bnew_map
 
     def _check_fitted(self) -> None:
         if any([
             not self.is_fitted_,
             self.coef_ is None,
-            self.selected_indices_ is None,
+            self.selected_paths_ is None,
             self.pr_list_ is None,
             self.p_mat_ is None,
             self.r_arr_ is None,

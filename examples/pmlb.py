@@ -45,7 +45,7 @@ if __name__ == "__main__":
         D = X.shape[1]
 
         mdl = SpectralPathRegressor(
-            total_cols=10*D,
+            max_paths=10*D,
             block_size=1 * D,
             lambda_grid=list(np.logspace(-5, -1, 25)),
             l_max=None,

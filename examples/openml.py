@@ -57,7 +57,7 @@ if __name__ == "__main__":
         D = X.shape[1]
 
         mdl = SpectralPathRegressor(
-            total_cols=30*D if dataset["openml_name"] !="Cancer_Drug_Response" else 3*D,
+            max_paths=30*D if dataset["openml_name"] !="Cancer_Drug_Response" else 3*D,
             block_size=1 * D,
             lambda_grid=list(np.logspace(-5, -1, 25)),
             l_max=None,

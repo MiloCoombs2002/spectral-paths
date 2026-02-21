@@ -1,9 +1,10 @@
+"""."""
+
 from dataclasses import dataclass
 from typing import List, Tuple
 
-import numpy as np
-
 from spectral_paths.types import Array
+
 
 @dataclass
 class FitReport:
@@ -29,3 +30,10 @@ class FitReport:
     history: List[Tuple[int, int, float, float]]
     stopped_early: bool
     feature_importance: Array | None = None
+
+@dataclass
+class Stats:
+    """Stats dataclass."""
+    stopped_early: bool
+    time_taken: float
+    history: List[Tuple[int, int, float, float]]

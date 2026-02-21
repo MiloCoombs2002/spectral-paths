@@ -1,11 +1,21 @@
+"""This module contains helper functiosn for the model."""
+
 import math
-from typing import Sequence, Tuple, List, Dict
-from numba import njit, prange
+from typing import List, Sequence, Tuple
+
 import numpy as np
+from numba import njit
+from sklearn.metrics import mean_squared_error, r2_score
 
-from sklearn.metrics import r2_score, mean_squared_error
+from spectral_paths.types import PR, Array, MVec
 
-from spectral_paths.types import Array, MVec, PR, PVec
+
+def check_dimensions(X: Array, y: Array) -> None:
+    """Helper function. Ensures X is 2D and dimensiosn of X and y are equal."""
+    if X.ndim != 2:
+        raise ValueError(f"X must be 2D, got shape {X.shape}")
+    if X.shape[0] != y.shape[0]:
+        raise ValueError(f"X rows {X.shape[0]} != y rows {y.shape[0]}")
 
 @njit(cache=True)
 def _cos_chebyshev(phi: float, r: int) -> float:
@@ -32,68 +42,44 @@ def _cos_chebyshev(phi: float, r: int) -> float:
     return t_nm1
 
 
-@njit(parallel=True, cache=True)
+@njit(cache=True)
 def _build_features_numba(
-    theta_batch: Array,
-    p_mat: Array,
-    r_arr: Array,
-    include_intercept: bool
-    ) -> Array:
+    theta_batch: Array, path_matrix: Array, r_arr: Array, include_intercept: bool
+) -> Array:
     """
-    Construct spectral path features using directional Chebyshev harmonics.
+    Build directional cosine-harmonic features for a batch of inputs.
 
-    For each sample θ ∈ R^D and each primitive direction p_q with harmonic
-    order r_q, this function computes the feature
-        cos(r_q * <p_q, θ>)
-    using a stable Chebyshev recurrence. Features are evaluated in two stages:
-    (i) directional phases <p_q, θ> are formed via dot products, and
-    (ii) Chebyshev harmonics are applied along each primitive ray.
+    For each sample `theta` and each path/order pair `(p_q, r_q)`, computes:
+        cos(r_q * <theta, p_q>)
 
-    The computation is fully parallelised over samples and features and is
-    designed to be used inside streamed Gram-matrix construction.
+    using the identity `T_r(cos(phi)) = cos(r * phi)`, where `phi = <theta, p_q>`.
+    Optionally prepends an intercept column of ones.
 
     Args:
-        theta_batch (Array): Array of angular inputs with shape (B, D),
-            where B is the batch size and D the number of features.
-        p_mat (Array): Matrix of primitive direction vectors with shape (Q, D).
-        r_arr (Array): Array of non-negative harmonic orders of length Q.
-        include_intercept (bool): Whether to prepend a constant intercept
-            feature equal to 1.
+        theta_batch: Input angles, shape `(B, D)`.
+        path_matrix: Direction vectors, shape `(Q, D)`.
+        r_arr: Harmonic orders, shape `(Q,)`.
+        include_intercept: If `True`, output column 0 is all ones.
 
     Returns:
-        Array: Feature matrix of shape (B, Q + 1) if include_intercept is True,
-        otherwise shape (B, Q). Each column corresponds to a directional
-        Chebyshev feature evaluated at the batch inputs.
+        Feature matrix of shape `(B, Q + 1)` if `include_intercept`, else `(B, Q)`.
     """
-    B, D = theta_batch.shape
-    Q = p_mat.shape[0]
+    B = theta_batch.shape[0]
+    Q = path_matrix.shape[0]
     M = Q + (1 if include_intercept else 0)
     out = np.empty((B, M), dtype=theta_batch.dtype)
 
-    # Intercept first to keep parity with previous layout
     start_col = 0
     if include_intercept:
         out[:, 0] = 1.0
         start_col = 1
 
-    # Compute phases in parallel over samples
-    phases = np.zeros((B, Q), dtype=theta_batch.dtype)
-    for i in prange(B):
-        for q in range(Q):
-            phi = 0.0
-            for d in range(D):
-                phi += theta_batch[i, d] * p_mat[q, d]
-            phases[i, q] = phi
-
-    # Apply Chebyshev transform in parallel over features
-    for q in prange(Q):
-        r = int(r_arr[q])
-        for i in range(B):
-            out[i, start_col + q] = _cos_chebyshev(phases[i, q], r)
+    phases = theta_batch @ path_matrix.T
+    out[:, start_col:] = np.cos(phases * r_arr[None, :])
 
     return out
 
-def _compute_initial_importance(theta_tr: Array, y_tr: Array, D: int) -> Array:
+def _compute_initial_importance(theta_tr: Array, y_tr: Array) -> Array:
         """
         Compute a heuristic feature-importance prior for search ordering.
 
@@ -101,23 +87,24 @@ def _compute_initial_importance(theta_tr: Array, y_tr: Array, D: int) -> Array:
             theta_tr (Array): Training inputs in angular coordinates with shape (N, D).
             y_tr(Array): Training targets with shape (N,)
             D (int): Number of features.
-        
+
         Returns:
             Non-negative importance weights of length D. If any signal is present, the
             weights are normalised to sum to one; otherwise all entries are zero.
         """
+        D = theta_tr.shape[1]
         importance = np.zeros(D, dtype=float)
-        
+
         for j in range(D):
             # Compute correlation between cos(theta_j) and y
             cos_theta_j = np.cos(theta_tr[:, j])
             corr = np.abs(np.corrcoef(cos_theta_j, y_tr)[0, 1])
             importance[j] = corr if not np.isnan(corr) else 0.0
-        
+
         # Normalize
         if importance.sum() > 0:
             importance = importance / importance.sum()
-        
+
         return importance
 
 def _gcd_list(vals: Sequence[int]) -> int:
@@ -136,71 +123,60 @@ def _gcd_list(vals: Sequence[int]) -> int:
         g = math.gcd(g, int(abs(v)))
     return g
 
-def _primitive_and_order(m: MVec) -> PR:
+def _primitive_and_order(path: MVec) -> PR:
     """
     Decompose a frequency vector into a primitive direction and harmonic order.
 
+    Example: (2,4,6,0,0) -> ((1,2,3,0,0), 2)
+
     Args:
-        m (MVec): Integer frequency vector.
+        path (Tuple[int, ...]): A spectral path.
 
     Returns:
-        PR: A tuple (p, r) where p is the primitive direction vector and
-        r is the positive integer harmonic order such that m = r * p.
+        Tuple[Tuple[int, ...], int]: A tuple (p, r) where p is the primitive direction
+        vector and r is the positive integer harmonic order such that m = r * p.
     """
-    nonzeros = [v for v in m if v != 0]
+    nonzeros = [v for v in path if v != 0]
     g = _gcd_list(nonzeros) if nonzeros else 1
     if g == 0:
         g = 1
-    p = tuple((vi // g) for vi in m)
+    p = tuple((vi // g) for vi in path)
     r = g
     return p, r
 
-def _group_by_primitive(
-        indices_nonzero: Sequence[MVec]
-    ) -> List[PR]:
+def _group_by_primitive(paths: Sequence[MVec]) -> List[PR]:
     """
     Group frequency vectors by primitive direction.
 
     Args:
-        indices_nonzero (Sequence[MVec]): Collection of nonzero frequency vectors.
+        paths (Sequence[Tule[int, ...]]): The chosen spectral paths.
 
     Returns:
-        List[PR]: A list of (primitive, order) pairs
+        result (List[Tuple[int, ...], int]): A list of (primitive, order) pairs
         corresponding to the input vectors, and a mapping from each primitive
         direction to the maximum harmonic order observed along that ray.
     """
-    pr_list: List[PR] = []
-    p_to_orders: Dict[PVec, set] = {}
-    for m in indices_nonzero:
-        p, r = _primitive_and_order(m)
-        pr_list.append((p, r))
-        p_to_orders.setdefault(p, set()).add(r)
+    pr_list = []
+    for path in paths:
+        primitive_path, order = _primitive_and_order(path)
+        pr_list.append((primitive_path, order))
     return pr_list
 
-def _pr_list_to_arrays(pr_list: List[PR], D: int | None) -> Tuple[Array, Array]:
+def _pr_list_to_arrays(pr_list: List[PR]) -> Tuple[Array, Array]:
     """
     Convert a list of primitive-ray specifications into array form.
 
     Args:
         pr_list (List[PR]): List of (primitive direction, harmonic order) pairs.
-        D (int | None): Expected dimensionality of the primitive vectors. If None,
-            the dimensionality is inferred from the first entry.
 
     Returns:
-        Tuple[Array, Array]: A pair (p_mat, r_arr) where p_mat is an integer
+        Tuple[Array, Array]: A pair (path_matrix, r_arr) where path_matrix is an integer
         array of primitive directions with shape (Q, D) and r_arr contains
         the corresponding harmonic orders.
     """
-    if not pr_list:
-        D_eff = int(D) if D is not None else 0
-        return np.zeros((0, D_eff), dtype=np.int64), np.zeros((0,), dtype=np.int64)
-    D_eff = len(pr_list[0][0]) if D is None else int(D)
-    p_mat = np.zeros((len(pr_list), D_eff), dtype=np.int64)
-    r_arr = np.zeros((len(pr_list),), dtype=np.int64)
-    for idx, (p, r) in enumerate(pr_list):
-        p_mat[idx, :] = np.array(p, dtype=np.int64)
-        r_arr[idx] = int(r)
-    return p_mat, r_arr
+    path_matrix = np.asarray([path for path, _ in pr_list], dtype=np.float64)
+    r_arr = np.asarray([order for _, order in pr_list], dtype=np.int64)
+    return path_matrix, r_arr
 
 def _metrics(y_true: Array, y_pred: Array) -> Tuple[float, float]:
     """
