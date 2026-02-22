@@ -43,8 +43,8 @@ def _cos_chebyshev(phi: float, r: int) -> float:
 
 
 @njit(cache=True)
-def _build_features_numba(
-    theta_batch: Array, path_matrix: Array, r_arr: Array, include_intercept: bool
+def _build_feature_matrix(
+    theta_batch: Array, path_matrix: Array, r_arr: Array, include_intercept: bool = True
 ) -> Array:
     """
     Build directional cosine-harmonic features for a batch of inputs.
@@ -149,7 +149,7 @@ def _group_by_primitive(paths: Sequence[MVec]) -> List[PR]:
     Group frequency vectors by primitive direction.
 
     Args:
-        paths (Sequence[Tule[int, ...]]): The chosen spectral paths.
+        paths (Sequence[Tuple[int, ...]]): The chosen spectral paths.
 
     Returns:
         result (List[Tuple[int, ...], int]): A list of (primitive, order) pairs
@@ -176,6 +176,12 @@ def _pr_list_to_arrays(pr_list: List[PR]) -> Tuple[Array, Array]:
     """
     path_matrix = np.asarray([path for path, _ in pr_list], dtype=np.float64)
     r_arr = np.asarray([order for _, order in pr_list], dtype=np.int64)
+    return path_matrix, r_arr
+
+def _path_matrix_and_r_arr(paths: Sequence[MVec]) -> Tuple[Array, Array]:
+    """."""
+    pr_list = _group_by_primitive(paths)
+    path_matrix, r_arr = _pr_list_to_arrays(pr_list)
     return path_matrix, r_arr
 
 def _metrics(y_true: Array, y_pred: Array) -> Tuple[float, float]:
