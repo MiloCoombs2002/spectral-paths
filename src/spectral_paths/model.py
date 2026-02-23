@@ -14,14 +14,12 @@ from sklearn.metrics import r2_score
 from sklearn.model_selection import train_test_split
 
 from spectral_paths.schemas import FitReport, Stats
-from spectral_paths.types import PR, Array, MVec, ScalerType
+from spectral_paths.types import Array, MVec, ScalerType
 from spectral_paths.utils.helpers import (
     _build_feature_matrix,
     _compute_initial_importance,
-    _group_by_primitive,
     _metrics,
     _path_matrix_and_r_arr,
-    _pr_list_to_arrays,
     check_dimensions,
 )
 from spectral_paths.utils.preprocessing import AngularTransformer
@@ -108,16 +106,26 @@ class SpectralPathRegressor:
             use_importance_ordering (bool): Whether to prioritise candidate paths using
                 univariate importanceheuristics.
         """
-        self.max_paths = int(max_paths)
+        if max_paths <= 0:
+            raise ValueError("max_paths must be a non-negative integer")
+        if not isinstance(max_paths, int):
+            raise ValueError("max_paths must be an integer")
+        self.max_paths = max_paths
         self.block_size = int(block_size)
-        self.lambda_grid = [float(x) for x in lambda_grid]
-        if not self.lambda_grid:
+        self.lambda_grid = [float(lam) for lam in lambda_grid]
+        if len(self.lambda_grid) == 0:
             raise ValueError("lambda_grid must contain at least one value.")
-        if any(not np.isfinite(x) or x < 0 for x in self.lambda_grid):
+        if any((not np.isfinite(lam)) or lam < 0.0 for lam in self.lambda_grid):
             raise ValueError("lambda_grid values must be finite and >= 0.")
         self.l_max = l_max
+        if self.l_max is not None and int(self.l_max) < 1:
+            raise ValueError("l_max must be >= 1 when provided.")
         self.batch_rows = int(batch_rows)
         self.k_values = tuple(int(k) for k in k_values)
+        if len(self.k_values) == 0:
+            raise ValueError("k_values must contain at least one integer.")
+        if any(k < 1 for k in self.k_values):
+            raise ValueError("All k_values must be >= 1.")
         self.val_size = float(val_size)
         self.random_state = int(random_state)
         self.verbose = bool(verbose)
@@ -136,11 +144,9 @@ class SpectralPathRegressor:
         self.adaptive_block_size = bool(adaptive_block_size)
         self.min_block_size = int(min_block_size)
         self.use_importance_ordering = bool(use_importance_ordering)
-        self.is_fitted_: bool = False
         self.n_features_in_: int | None = None
 
         self.selected_paths_: List[MVec] | None = None
-        self.pr_list_: List[PR] | None = None
         self.lambda_: float | None = None
         self.coef_: Array | None = None
         self.fit_report_: FitReport | None = None
@@ -214,10 +220,9 @@ class SpectralPathRegressor:
         self.lambda_ = lambda_star
         self.coef_ = coeffs.astype(float, copy=False)
 
-    def _cache_ray_structures(self, indices: List[MVec]) -> None:
+    def _cache_ray_structures(self, paths: List[MVec]) -> None:
         """Cache ray structures in self to improve inference speed."""
-        self.pr_list_ = _group_by_primitive(indices)
-        self.p_mat_, self.r_arr_ = _pr_list_to_arrays(self.pr_list_)
+        self.p_mat_, self.r_arr_ = _path_matrix_and_r_arr(paths)
 
     def _calculate_coeffs(
         self, theta: Array, y: Array, paths: List[MVec], lambda_star: float
@@ -242,12 +247,14 @@ class SpectralPathRegressor:
         X = np.asarray(X)
         y = np.asarray(y, dtype=float).ravel()
         check_dimensions(X,y)
-        self.n_features_in_ = X.shape[1]
-
-        # Train - val split
+        self.n_features_in_ = cast(int, X.shape[1])
+        k_max = max(self.k_values)
+        if k_max > self.n_features_in_:
+            raise ValueError(
+                f"Invalid k_values: max(k_values)={k_max} exceeds n_features."
+            )
         X_tr, y_tr, X_val, y_val = self.prepare_train_val_split(X,y,X_val,y_val)
 
-        # Scale & transform
         theta_tr, theta_val = self._transform_data(X_tr, X_val)
 
         self._compute_feature_importance(theta_tr, y_tr)
@@ -266,7 +273,7 @@ class SpectralPathRegressor:
         self._save_learned_state(paths, lambda_star, coefficients)
         self._cache_ray_structures(paths)
 
-        final_importance = self._compute_feature_importance_from_model()
+        feature_importance = self._compute_feature_importance_from_model()
 
         self.fit_report_ = FitReport(
             lambda_star=lambda_star,
@@ -275,10 +282,9 @@ class SpectralPathRegressor:
             final_solve_time_sec=solve_time,
             history=stats.history,
             stopped_early=stats.stopped_early,
-            feature_importance=final_importance,
+            feature_importance=feature_importance,
         )
 
-        self.is_fitted_ = True
         return self
 
     def predict(self, X: Array) -> Array:
@@ -291,7 +297,6 @@ class SpectralPathRegressor:
         Returns:
             Predicted target values with shape (n_samples,).
         """
-        self._check_fitted()
         X = np.asarray(X)
         if X.ndim != 2:
             raise ValueError(f"X must be 2D, got shape {X.shape}")
@@ -304,12 +309,7 @@ class SpectralPathRegressor:
             raise ValueError("Transformer has not been fitted yet")
         theta = self.transformer_.transform(X)
 
-        # Use cached structures for speed
-        self.pr_list_ = cast(List[PR], self.pr_list_)
-        self.coef_ = cast(Array, self.coef_)
-        yhat = self._streamed_predict_from_struct(
-            theta, self.pr_list_, self.coef_, self.p_mat_, self.r_arr_
-        )
+        yhat = self._stream_predict(theta)
         return yhat
 
     def score(self, X: Array, y: Array) -> float:
@@ -385,9 +385,7 @@ class SpectralPathRegressor:
                     yield tuple(m)
             L += 1
 
-    # ------------------- Column normalization + ridge solve -------------------
-
-    def _column_scales_from_gram(self, G: Array) -> Array:
+    def _calc_scaling_vector(self, G: Array) -> Array:
         # s_j = ||Phi_j||_2 = sqrt(G_jj)
         s = np.sqrt(np.maximum(np.diag(G), 0.0))
         s = np.where(s < self.eps_col_norm, 1.0, s)
@@ -395,7 +393,7 @@ class SpectralPathRegressor:
             s[0] = 1.0
         return s
 
-    def _solve_normal_eqn(self, G: Array, b: Array, lam: float) -> Array:
+    def _solve_normal_eqn(self, G: Array, b: Array, lambda_: float) -> Array:
         """
         Solve ridge from Gram, optionally with implicit column normalization.
 
@@ -405,24 +403,41 @@ class SpectralPathRegressor:
             Return w = (1/s) * w_tilde (so predictions use original Phi).
         """
         if self.normalize_columns:
-            s = self._column_scales_from_gram(G)
-            inv_s = 1.0 / s
+            scaling_vector = self._calc_scaling_vector(G)
+            inv_s = 1.0 / scaling_vector
             G = (inv_s[:, None] * G) * inv_s[None, :]
             b = inv_s * b
 
             evals, U = np.linalg.eigh(G)
-            w_tilde = self._solve_with_cached_eigs(evals, U, b, lam)
+            coeffs = self._ridge_solve_for_coeffs(evals, U, b, lambda_)
+            coeffs = inv_s * coeffs
 
-            w = inv_s * w_tilde
-            return w
+            return coeffs
 
         evals, U = np.linalg.eigh(G)
-        w = self._solve_with_cached_eigs(evals, U, b, lam)
-        return w
+        coeffs = self._ridge_solve_for_coeffs(evals, U, b, lambda_)
+        return coeffs
 
-    def _solve_with_cached_eigs(
+    def _ridge_solve_for_coeffs(
         self, evals: Array, U: Array, b: Array, lam: float
     ) -> Array:
+        """
+        Solve the ridge linear system using a precomputed eigendecomposition.
+
+        Given G = U diag(evals) U^T, this returns
+            w = (G + lam I)^(-1) b
+        by applying the spectral form
+            w = U diag(1 / (evals + lam)) U^T b.
+
+        Args:
+            evals: Eigenvalues of the symmetric Gram matrix G.
+            U: Orthonormal eigenvectors of G (columns of U).
+            b: Right-hand-side vector.
+            lam: Nonnegative ridge regularization strength.
+
+        Returns:
+            Coefficient vector w solving (G + lam I) w = b.
+        """
         UTb = U.T @ b
         inv_diag = 1.0 / (evals + lam)
         return U @ (inv_diag * UTb)
@@ -430,6 +445,25 @@ class SpectralPathRegressor:
     def _compute_normal_eqn(
         self, theta: Array, y: Array, paths: Sequence[MVec]
     ) -> Tuple[Array, Array]:
+        """
+        Build normal-equation terms given a lsit of paths, in streaming batches.
+
+        Constructs the feature map implied by `paths` (with intercept) and accumulates:
+            G = Phi^T Phi
+            b = Phi^T y
+        across row batches of size `self.batch_rows`.
+
+        Args:
+            theta (Array): Angular-transformed inputs with shape (N, D).
+            y (Array): Target vector with shape (N,).
+            paths (Sequence[Tuple[int, ...]]): Selected spectral paths defining feature
+                columns (excluding intercept).
+
+        Returns:
+            out (Tuple[Array, Array]): A tuple `(G, b)` where:
+            - `G` has shape (M, M) with `M = 1 + len(paths)`,
+            - `b` has shape (M,).
+        """
         path_matrix, orders = _path_matrix_and_r_arr(paths)
         M = 1 + len(paths)
 
@@ -448,11 +482,10 @@ class SpectralPathRegressor:
 
         return G, b
 
-    def _streamed_predict_from_struct(
+    def _stream_predict(
         self,
         theta: Array,
-        pr_list: List[PR],
-        w: Array,
+        coeffs: Array | None = None,
         p_mat: Array | None = None,
         r_arr: Array | None = None,
     ) -> Array:
@@ -461,22 +494,21 @@ class SpectralPathRegressor:
                 p_mat = self.p_mat_
                 r_arr = self.r_arr_
             else:
-                p_mat, r_arr = _pr_list_to_arrays(pr_list)
+                raise ValueError("p_mat and r_arr not parsed as args or in self")
+        if coeffs is None:
+            if self.coef_ is not None:
+                coeffs = self.coef_
+            else:
+                raise ValueError("No coefficicnets found in self nor args")
 
         N = theta.shape[0]
         yhat = np.empty(N, dtype=float)
 
         for start in range(0, N, self.batch_rows):
             end = min(N, start + self.batch_rows)
-            Phi_b = _build_feature_matrix(
-                theta[start:end].astype(
-                    np.float32 if self.use_float32 else np.float64, copy=False
-                ),
-                p_mat,
-                r_arr,
-                True,
-            )
-            yhat[start:end] = Phi_b @ w
+            theta_batch = self._batch(theta, start, end)
+            Phi_b = _build_feature_matrix(theta_batch, p_mat, r_arr)
+            yhat[start:end] = Phi_b @ coeffs
 
         return yhat
 
@@ -492,36 +524,35 @@ class SpectralPathRegressor:
         best_lam = self.lambda_grid[0]
 
         # Precompute structures once for validation prediction speed
-        pr_list = _group_by_primitive(paths)
-        p_mat, r_arr = _pr_list_to_arrays(pr_list)
+        p_mat, r_arr = _path_matrix_and_r_arr(paths)
 
         # Cache eigendecomp for lambda sweep
         if self.normalize_columns:
-            s = self._column_scales_from_gram(G_tr)
+            s = self._calc_scaling_vector(G_tr)
             inv_s = 1.0 / s
             Gs = (inv_s[:, None] * G_tr) * inv_s[None, :]
             bs = inv_s * b_tr
             evals, U = np.linalg.eigh(Gs)
 
             def solve_for_coeffs(lam_val: float) -> Array:
-                w_tilde = self._solve_with_cached_eigs(evals, U, bs, lam_val)
+                w_tilde = self._ridge_solve_for_coeffs(evals, U, bs, lam_val)
                 return inv_s * w_tilde
 
         else:
             evals, U = np.linalg.eigh(G_tr)
 
             def solve_for_coeffs(lam_val: float) -> Array:
-                return self._solve_with_cached_eigs(evals, U, b_tr, lam_val)
+                return self._ridge_solve_for_coeffs(evals, U, b_tr, lam_val)
 
         for lam in self.lambda_grid:
-            w = solve_for_coeffs(float(lam))
-            y_val_hat = self._streamed_predict_from_struct(
-                theta_val, pr_list, w, p_mat, r_arr
+            w = solve_for_coeffs(lam)
+            y_val_hat = self._stream_predict(
+                theta=theta_val, coeffs=w, p_mat=p_mat, r_arr=r_arr
             )
             _, r2v = _metrics(y_val, y_val_hat)
             if r2v > best_r2:
                 best_r2 = r2v
-                best_lam = float(lam)
+                best_lam = lam
 
         return best_lam
 
@@ -563,44 +594,31 @@ class SpectralPathRegressor:
                 p_mat_old, r_arr_old = _path_matrix_and_r_arr(selected_paths)
             M_old = 1 + len(selected_paths)
 
-            # Generate maps & candidate strcutures
+            # Generate maps & candidate structures
             cand_struct, C_map, Gnew_map, bnew_map = self._init_candidate_evaluation(
                 candidates, M_old
             )
 
             # Loop through training data batch by batch to build C, G, and b
-            for start in range(0, Ntr, self.batch_rows):
-                end = min(Ntr, start + self.batch_rows)
-                y_batch = self._batch(y_tr, start, end)
-                theta_batch = self._batch(theta_tr, start, end)
-
-                Phi_old_batch = _build_feature_matrix(theta_batch, p_mat_old, r_arr_old)
-
-                # Loop through k values, e.g., 1, 2, 3
-                for k, (p_mat_block, r_arr_block) in cand_struct.items():
-                    Phi_new_batch = _build_feature_matrix(
-                        theta_batch, p_mat_block, r_arr_block, False
-                    )
-
-                    C_map[k] += Phi_old_batch.T @ Phi_new_batch
-                    Gnew_map[k] += Phi_new_batch.T @ Phi_new_batch
-                    bnew_map[k] += Phi_new_batch.T @ y_batch
+            C_map, Gnew_map, bnew_map = self._build_c_g_and_b_via_stream(
+                y_tr, theta_tr, p_mat_old, r_arr_old, cand_struct,
+                C_map, Gnew_map, bnew_map
+            )
 
             # Evaluate candidates (solve on train using block Gram; score on val)
             best_r2_score = -1e18
-            best_choice = None  # (k, block, G_trial, b_trial, lam_used)
+            best_choice = None
 
             for k, paths in candidates.items():
                 C = C_map[k]
                 Gnew = Gnew_map[k]
                 bnew = bnew_map[k]
 
-                # Build trial Gram/b
+                # Build trial data
                 G_trial = np.block([[G_old, C], [C.T,  Gnew]])
                 b_trial = np.concatenate([b_old, bnew])
                 trial_paths = selected_paths + paths
-                pr_trial = _group_by_primitive(trial_paths)
-                p_mat_trial, r_arr_trial = _pr_list_to_arrays(pr_trial)
+                p_mat_trial, r_arr_trial = _path_matrix_and_r_arr(trial_paths)
 
                 # Solve (possibly with lambda sweep on first commit)
                 if lambda_star is None:
@@ -608,65 +626,66 @@ class SpectralPathRegressor:
                     best_lam_this = self.lambda_grid[0]
 
                     if self.normalize_columns:
-                        s_trial = self._column_scales_from_gram(G_trial)
-                        inv_s_trial = 1.0 / s_trial
+                        scaling_vector = self._calc_scaling_vector(G_trial)
+                        inv_s_trial = 1.0 / scaling_vector
                         Gs_trial = (
                             (inv_s_trial[:, None] * G_trial) * inv_s_trial[None, :]
                         )
-                        bs_trial = inv_s_trial * b_trial
-                        evals_trial, U_trial = np.linalg.eigh(Gs_trial)
-
-                        def solve_for_coeffs(lam_val: float) -> Array:
-                            w_tilde = self._solve_with_cached_eigs(
-                                evals_trial, U_trial, bs_trial, lam_val
+                        scaled_b_trial = inv_s_trial * b_trial
+                        scaled_evals_trial, U_trial = np.linalg.eigh(Gs_trial)
+                        for lambda_ in self.lambda_grid:
+                            scaled_coeffs = self._ridge_solve_for_coeffs(
+                                scaled_evals_trial, U_trial, scaled_b_trial, lambda_
                             )
-                            return inv_s_trial * w_tilde
-
+                            normalized_coeffs = scaled_coeffs * inv_s_trial
+                            y_val_hat = self._stream_predict(
+                                theta_val, normalized_coeffs, p_mat_trial, r_arr_trial
+                            )
+                            _, r2v = _metrics(y_val, y_val_hat)
+                            if r2v > best_r2_this:
+                                best_r2_this = r2v
+                                best_lam_this = lambda_
                     else:
                         evals_trial, U_trial = np.linalg.eigh(G_trial)
-
-                        def solve_for_coeffs(lam_val: float) -> Array:
-                            return self._solve_with_cached_eigs(
-                                evals_trial, U_trial, b_trial, lam_val
+                        for lambda_ in self.lambda_grid:
+                            coeffs = self._ridge_solve_for_coeffs(
+                                evals_trial, U_trial, b_trial, lambda_
                             )
-
-                    for lambda_ in self.lambda_grid:
-                        coeffs = solve_for_coeffs(lambda_)
-                        y_val_hat = self._streamed_predict_from_struct(
-                            theta_val, pr_trial, coeffs, p_mat_trial, r_arr_trial
-                        )
-                        _, r2v = _metrics(y_val, y_val_hat)
-                        if r2v > best_r2_this:
-                            best_r2_this = r2v
-                            best_lam_this = lambda_
+                            y_val_hat = self._stream_predict(
+                                theta_val, coeffs, p_mat_trial, r_arr_trial
+                            )
+                            _, r2v = _metrics(y_val, y_val_hat)
+                            if r2v > best_r2_this:
+                                best_r2_this = r2v
+                                best_lam_this = lambda_
 
                     cand_r2_score = best_r2_this
-                    lambda_ = float(best_lam_this)
+                    cand_lambda = best_lam_this
                 else:
-                    w = self._solve_normal_eqn(G_trial, b_trial, float(lambda_star))
-                    y_val_hat = self._streamed_predict_from_struct(
-                        theta_val, pr_trial, w, p_mat_trial, r_arr_trial
+                    coeffs = self._solve_normal_eqn(G_trial, b_trial, lambda_star)
+                    y_val_hat = self._stream_predict(
+                        theta_val, coeffs, p_mat_trial, r_arr_trial
                     )
                     _, cand_r2_score = _metrics(y_val, y_val_hat)
-                    lambda_ = float(lambda_star)
+                    cand_lambda = lambda_star
 
                 if cand_r2_score > best_r2_score:
                     best_r2_score = cand_r2_score
-                    best_choice = (k, paths, G_trial, b_trial, lambda_)
+                    best_choice = (k, paths, G_trial, b_trial, cand_lambda)
 
-            # Commit best
-            k_win, block_win, G_new_old, b_new_old, lam_win = best_choice  # type: ignore
+            # Update with new best things
+            assert best_choice is not None # (for type checkers)
+            k_win, block_win, G_new_old, b_new_old, lam_win = best_choice
             selected_paths.extend(block_win)
             G_old = G_new_old
             b_old = b_new_old
-
             if lambda_star is None:
-                lambda_star = float(lam_win)
-
-            history.append((k_win, len(block_win), float(lambda_star), best_r2_score))
+                lambda_star = lam_win
+            history.append((k_win, len(block_win), lambda_star, best_r2_score))
 
             # Early stopping check
-            if best_r2_score > best_r2_score_overall + self.early_stopping_tol:
+            improving = best_r2_score > best_r2_score_overall + self.early_stopping_tol
+            if improving:
                 best_r2_score_overall = best_r2_score
                 no_improve_count = 0
 
@@ -676,9 +695,11 @@ class SpectralPathRegressor:
             else:
                 no_improve_count += 1
 
-                # Decrease block size if plateauing
-                plateauing = current_block_size > self.min_block_size
-                if plateauing and self.adaptive_block_size:
+                # Given we're not improving, decrease block size if allowed
+                if (
+                    current_block_size > self.min_block_size
+                    and self.adaptive_block_size
+                    ):
                     current_block_size=max(self.min_block_size, current_block_size - 1)
 
                 if no_improve_count >= self.early_stopping_patience:
@@ -696,7 +717,7 @@ class SpectralPathRegressor:
             )
 
         if lambda_star is None:
-            lambda_star = self.lambda_grid[0] if self.lambda_grid else 0.0
+            lambda_star = self.lambda_grid[0]
 
         # Optional re-sweep
         if self.final_lambda_refit and len(self.lambda_grid) > 0:
@@ -704,11 +725,41 @@ class SpectralPathRegressor:
                 G_old, b_old, theta_val, y_val, selected_paths
             )
         t1 = time.perf_counter()
-        # Return final training Gram/b for the selected dict (already in G_old/b_old)
+
         stats = Stats(stopped_early=stopped_early, history=history, time_taken=t1-t0)
-        return selected_paths, float(lambda_star), stats
+        return selected_paths, lambda_star, stats
 
     # ------------------- Misc -------------------
+    def _build_c_g_and_b_via_stream(
+        self,
+        y_tr: Array,
+        theta_tr: Array,
+        p_mat_old: Array,
+        r_arr_old: Array,
+        cand_struct: Dict[int, Tuple[Array, Array]],
+        C_map: Dict[int, Array],
+        Gnew_map: Dict[int, Array],
+        bnew_map: Dict[int, Array]
+    ) -> tuple[Dict[int, Array], Dict[int, Array], Dict[int, Array]]:
+        Ntr = theta_tr.shape[0]
+        for start in range(0, Ntr, self.batch_rows):
+            end = min(Ntr, start + self.batch_rows)
+
+            y_batch = self._batch(y_tr, start, end)
+            theta_batch = self._batch(theta_tr, start, end)
+            Phi_old_batch = _build_feature_matrix(theta_batch, p_mat_old, r_arr_old)
+
+            # Loop through k values, e.g., 1, 2, 3
+            for k, (p_mat_block, r_arr_block) in cand_struct.items():
+                Phi_new_batch = _build_feature_matrix(
+                    theta_batch, p_mat_block, r_arr_block, False
+                )
+
+                C_map[k] += Phi_old_batch.T @ Phi_new_batch
+                Gnew_map[k] += Phi_new_batch.T @ Phi_new_batch
+                bnew_map[k] += Phi_new_batch.T @ y_batch
+
+        return C_map, Gnew_map, bnew_map
     def _log(self, message: str) -> None:
         if self.verbose:
             print(message)
@@ -758,23 +809,9 @@ class SpectralPathRegressor:
         Gnew_map: Dict[int, Array] = {}
         bnew_map: Dict[int, Array] = {}
         for k, block in candidates.items():
-            pr_block = _group_by_primitive(block)
-            p_mat_block, r_arr_block = _pr_list_to_arrays(pr_block)
-            cand_struct[k] = (p_mat_block, r_arr_block)
-
-            Qnew = len(pr_block)
+            cand_struct[k] = _path_matrix_and_r_arr(block)
+            Qnew = len(block)
             C_map[k] = np.zeros((M_old, Qnew), dtype=float)
             Gnew_map[k] = np.zeros((Qnew, Qnew), dtype=float)
             bnew_map[k] = np.zeros(Qnew, dtype=float)
         return cand_struct, C_map, Gnew_map, bnew_map
-
-    def _check_fitted(self) -> None:
-        if any([
-            not self.is_fitted_,
-            self.coef_ is None,
-            self.selected_paths_ is None,
-            self.pr_list_ is None,
-            self.p_mat_ is None,
-            self.r_arr_ is None,
-        ]):
-            raise RuntimeError("Model is not fitted yet. Call fit(X, y) first.")
