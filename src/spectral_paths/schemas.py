@@ -1,9 +1,22 @@
 """."""
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import List, Tuple
 
 from spectral_paths.types import Array
+
+
+class ScalerType(StrEnum):
+    """Allowed scaler modes for angular preprocessing."""
+
+    MINMAX = "minmax"
+    STANDARD_TANH = "standard_tanh"
+    ROBUST_TANH = "robust_tanh"
+    STANDARD_PERCENTILE_MINMAX = "standard_percentile_minmax"
+    ROBUST_PERCENTILE_MINMAX = "robust_percentile_minmax"
+    STANDARD = "standard"
+    ROBUST = "robust"
 
 
 @dataclass

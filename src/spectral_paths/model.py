@@ -11,16 +11,16 @@ from typing import Dict, Iterator, List, Sequence, Tuple, cast
 
 import numpy as np
 from sklearn.metrics import r2_score
-from sklearn.model_selection import train_test_split
 
-from spectral_paths.schemas import FitReport, Stats
-from spectral_paths.types import Array, MVec, ScalerType
+from spectral_paths.schemas import FitReport, ScalerType, Stats
+from spectral_paths.types import Array, MVec
 from spectral_paths.utils.helpers import (
     _build_feature_matrix,
     _compute_initial_importance,
     _metrics,
     _path_matrix_and_r_arr,
     check_dimensions,
+    train_test_split,
 )
 from spectral_paths.utils.preprocessing import AngularTransformer
 
@@ -54,7 +54,7 @@ class SpectralPathRegressor:
         early_stopping_tol: float = 1e-4,
 
         # -------- scaler config --------
-        scaler_type: ScalerType = "standard_percentile_minmax",
+        scaler_type: ScalerType | str = ScalerType.STANDARD_PERCENTILE_MINMAX,
         iqr_percentile_range: Tuple[float, float] = (25.0, 75.0),
         bound_percentiles: Tuple[float, float] = (2.0, 98.0),
 
@@ -95,8 +95,8 @@ class SpectralPathRegressor:
                 tolerated before early stopping of greedy path selection.
             early_stopping_tol (float): Minimum validation improvement required to reset
                 early stopping.
-            scaler_type (ScalerType): Scaling strategy used to map inputs to the
-                interval [-1, 1] prior to the angular transformation.
+            scaler_type (ScalerType | str): Scaling strategy used to map inputs to
+                the interval [-1, 1] prior to the angular transformation.
             iqr_percentile_range (Tuple[float, float]): Lower and upper percentiles used
                 for percentile-based scaling.
             adaptive_block_size (bool): Whether to adapt the block size during greedy
@@ -137,7 +137,13 @@ class SpectralPathRegressor:
         self.early_stopping_patience = int(early_stopping_patience)
         self.early_stopping_tol = float(early_stopping_tol)
 
-        self.scaler_type = str(scaler_type)
+        try:
+            self.scaler_type = ScalerType(scaler_type)
+        except ValueError as exc:
+            allowed = ", ".join(mode.value for mode in ScalerType)
+            raise ValueError(
+                f"Unsupported scaler_type {scaler_type!r}. Allowed values: {allowed}."
+            ) from exc
         self.transformer_: AngularTransformer | None = None
         self.iqr_percentile_range = iqr_percentile_range
         self.bound_percentiles = bound_percentiles
@@ -155,41 +161,26 @@ class SpectralPathRegressor:
         self.feature_importance_: Array | None = None
 
     def _make_transformer(self) -> AngularTransformer:
-        """
-        Construct an AngularTransformer instance from this model's scaler config.
-
-        Returns:
-            AngularTransformer: an instance of AngularTransformer
-        """
-        if self.scaler_type not in (
-            "standard_percentile_minmax", "robust_percentile_minmax",
-            "standard_tanh","robust_tanh", "minmax"
-        ):
-            raise ValueError("Scaler type not supported")
-
+        """Construct an AngularTransformer instance from this model's scaler config."""
         return AngularTransformer(
-            scaler=self.scaler_type, # type: ignore
+            scaler=self.scaler_type,
             percentile_range=self.iqr_percentile_range,
             bound_percentiles=self.bound_percentiles,
-            eps=float(getattr(self, "eps_scaler", self.eps_col_norm)),
+            eps=self.eps_col_norm,
         )
 
-    def prepare_train_val_split(
+    def _prepare_train_val_split(
         self, X: Array, y: Array, X_val: Array | None, y_val: Array | None
     ) -> tuple[Array, Array, Array, Array]:
         """Prepares training and validation data."""
         if X_val is None or y_val is None:
-            X_tr, X_val2, y_tr, y_val2 = cast(
-                tuple[Array, Array, Array, Array],
-                train_test_split(
-                    X, y, test_size=self.val_size, random_state=self.random_state
-                ),
-            )
+            X_tr, X_val2, y_tr, y_val2 = train_test_split(X, y, self.val_size, self.random_state)
             X_val, y_val = X_val2, y_val2
+
         else:
             X_tr, y_tr = X, y
-            X_val = np.asarray(X_val)
             y_val = np.asarray(y_val, dtype=float).ravel()
+
             if X_val.ndim != 2 or X_val.shape[1] != X_tr.shape[1]:
                 raise ValueError("X_val must be 2D with same number of columns as X.")
             if X_val.shape[0] != y_val.shape[0]:
@@ -200,21 +191,19 @@ class SpectralPathRegressor:
     def _transform_data(self, X_tr: Array, X_val: Array) -> tuple[Array, Array]:
         """Initalise transformer. Scale, and angualr transform X_tr, and X_val."""
         self.transformer_ = self._make_transformer()
-        theta_tr = self.transformer_.fit_transform(X_tr)
-        theta_val = self.transformer_.transform(X_val)
+        θ_tr = self.transformer_.fit_transform(X_tr)
+        θ_val = self.transformer_.transform(X_val)
 
-        return theta_tr, theta_val
+        return θ_tr, θ_val
 
-    def _compute_feature_importance(self, theta_tr: Array, y_tr: Array) -> None:
+    def _compute_feature_importance(self, θ_tr: Array, y_tr: Array) -> None:
         """If use_importance_ordering, compute_initial feature importance."""
         if self.use_importance_ordering:
-            self.feature_importance_ = _compute_initial_importance(theta_tr, y_tr)
+            self.feature_importance_ = _compute_initial_importance(θ_tr, y_tr)
         else:
             self.feature_importance_ = None
 
-    def _save_learned_state(
-        self, paths: List[MVec], lambda_star: float, coeffs: Array
-    ) -> None:
+    def _save_learned_state(self, paths: List[MVec], lambda_star: float, coeffs: Array) -> None:
         """Save indices, lambda* and coefficents to self."""
         self.selected_paths_ = paths
         self.lambda_ = lambda_star
@@ -225,50 +214,39 @@ class SpectralPathRegressor:
         self.p_mat_, self.r_arr_ = _path_matrix_and_r_arr(paths)
 
     def _calculate_coeffs(
-        self, theta: Array, y: Array, paths: List[MVec], lambda_star: float
+        self, θ: Array, y: Array, paths: List[MVec], lambda_star: float
     ) -> tuple[float, Array]:
         """Compute normal equation, solve it, return coefficients + time taken."""
         t2 = time.perf_counter()
-        gram_matrix, target_col = self._compute_normal_eqn(theta, y, paths)
+        gram_matrix, target_col = self._compute_normal_eqn(θ, y, paths)
         coefficients = self._solve_normal_eqn(gram_matrix, target_col, lambda_star)
         t3 = time.perf_counter()
         return t3-t2, coefficients
 
     def fit(
-        self,
-        X: Array,
-        y: Array,
-        *,
-        X_val: Array | None = None,
-        y_val: Array | None = None
+        self, X: Array, y: Array, *, X_val: Array | None = None, y_val: Array | None = None
     ) -> "SpectralPathRegressor":
         """Fit the model."""
-        # Preparation
         X = np.asarray(X)
         y = np.asarray(y, dtype=float).ravel()
         check_dimensions(X,y)
-        self.n_features_in_ = cast(int, X.shape[1])
+
+        self.n_features_in_ = int(X.shape[1])
         k_max = max(self.k_values)
         if k_max > self.n_features_in_:
             raise ValueError(
                 f"Invalid k_values: max(k_values)={k_max} exceeds n_features."
             )
-        X_tr, y_tr, X_val, y_val = self.prepare_train_val_split(X,y,X_val,y_val)
 
-        theta_tr, theta_val = self._transform_data(X_tr, X_val)
+        X_tr, y_tr, X_val, y_val = self._prepare_train_val_split(X, y, X_val, y_val)
+        θ_tr, θ_val = self._transform_data(X_tr, X_val)
 
-        self._compute_feature_importance(theta_tr, y_tr)
+        self._compute_feature_importance(θ_tr, y_tr)
+        paths, lambda_star, stats = self._select_paths_and_lambda(θ_tr, y_tr, θ_val, y_val)
 
-        paths, lambda_star, stats = self._select_paths_and_lambda(
-            theta_tr, y_tr, theta_val, y_val
-        )
-
-        theta_all = cast(Array, np.vstack([theta_tr, theta_val]))
+        θ_all = cast(Array, np.vstack([θ_tr, θ_val]))
         y_all = cast(Array, np.concatenate([y_tr, y_val]))
-
-        solve_time, coefficients = self._calculate_coeffs(
-            theta_all, y_all, paths, lambda_star
-        )
+        solve_time, coefficients = self._calculate_coeffs(θ_all, y_all, paths, lambda_star)
 
         self._save_learned_state(paths, lambda_star, coefficients)
         self._cache_ray_structures(paths)
@@ -288,15 +266,7 @@ class SpectralPathRegressor:
         return self
 
     def predict(self, X: Array) -> Array:
-        """
-        Predict target values for input samples.
-
-        Args:
-            X (Array): Input samples with shape (n_samples, n_features).
-
-        Returns:
-            Predicted target values with shape (n_samples,).
-        """
+        """Predict target values for input samples."""
         X = np.asarray(X)
         if X.ndim != 2:
             raise ValueError(f"X must be 2D, got shape {X.shape}")
@@ -307,9 +277,9 @@ class SpectralPathRegressor:
 
         if self.transformer_ is None:
             raise ValueError("Transformer has not been fitted yet")
-        theta = self.transformer_.transform(X)
 
-        yhat = self._stream_predict(theta)
+        θ = self.transformer_.transform(X)
+        yhat = self._stream_predict(θ)
         return yhat
 
     def score(self, X: Array, y: Array) -> float:
@@ -386,7 +356,7 @@ class SpectralPathRegressor:
             L += 1
 
     def _calc_scaling_vector(self, G: Array) -> Array:
-        # s_j = ||Phi_j||_2 = sqrt(G_jj)
+        # s_j = ||Φ_j||_2 = sqrt(G_jj)
         s = np.sqrt(np.maximum(np.diag(G), 0.0))
         s = np.where(s < self.eps_col_norm, 1.0, s)
         if not self.normalize_intercept and s.size > 0:
@@ -398,9 +368,9 @@ class SpectralPathRegressor:
         Solve ridge from Gram, optionally with implicit column normalization.
 
         If normalized:
-            Phi_tilde = Phi * diag(1/s)
+            Φ_tilde = Φ * diag(1/s)
             Solve (G_tilde + lam I) w_tilde = b_tilde
-            Return w = (1/s) * w_tilde (so predictions use original Phi).
+            Return w = (1/s) * w_tilde (so predictions use original Φ).
         """
         if self.normalize_columns:
             scaling_vector = self._calc_scaling_vector(G)
@@ -443,18 +413,18 @@ class SpectralPathRegressor:
         return U @ (inv_diag * UTb)
 
     def _compute_normal_eqn(
-        self, theta: Array, y: Array, paths: Sequence[MVec]
+            self, θ: Array, y: Array, paths: Sequence[MVec]
     ) -> Tuple[Array, Array]:
         """
-        Build normal-equation terms given a lsit of paths, in streaming batches.
+        Build normal-equation terms given a list of paths, in streaming batches.
 
         Constructs the feature map implied by `paths` (with intercept) and accumulates:
-            G = Phi^T Phi
-            b = Phi^T y
+            G = Φ^T Φ
+            b = Φ^T y
         across row batches of size `self.batch_rows`.
 
         Args:
-            theta (Array): Angular-transformed inputs with shape (N, D).
+            θ (Array): Angular-transformed inputs with shape (N, D).
             y (Array): Target vector with shape (N,).
             paths (Sequence[Tuple[int, ...]]): Selected spectral paths defining feature
                 columns (excluding intercept).
@@ -471,20 +441,22 @@ class SpectralPathRegressor:
         G = np.zeros((M, M), dtype=float)
         b = np.zeros(M, dtype=float)
 
-        N = theta.shape[0]
+        N = θ.shape[0]
         for start in range(0, N, self.batch_rows):
             end = min(N, start + self.batch_rows)
-            theta_batch = self._batch(theta, start, end)
-            Phi_b = _build_feature_matrix(theta_batch, path_matrix, orders, True)
-            y_batch = y[start:end]
-            G += Phi_b.T @ Phi_b
-            b += Phi_b.T @ y_batch
+
+            θ_b = self._batch(θ, start, end)
+            Φ_b = _build_feature_matrix(θ_b, path_matrix, orders)
+            y_b = y[start:end]
+
+            G += Φ_b.T @ Φ_b
+            b += Φ_b.T @ y_b
 
         return G, b
 
     def _stream_predict(
         self,
-        theta: Array,
+        θ: Array,
         coeffs: Array | None = None,
         p_mat: Array | None = None,
         r_arr: Array | None = None,
@@ -499,16 +471,16 @@ class SpectralPathRegressor:
             if self.coef_ is not None:
                 coeffs = self.coef_
             else:
-                raise ValueError("No coefficicnets found in self nor args")
+                raise ValueError("No coefficients found in self nor args")
 
-        N = theta.shape[0]
+        N = θ.shape[0]
         yhat = np.empty(N, dtype=float)
 
         for start in range(0, N, self.batch_rows):
             end = min(N, start + self.batch_rows)
-            theta_batch = self._batch(theta, start, end)
-            Phi_b = _build_feature_matrix(theta_batch, p_mat, r_arr)
-            yhat[start:end] = Phi_b @ coeffs
+            θ_b = self._batch(θ, start, end)
+            Φ_b = _build_feature_matrix(θ_b, p_mat, r_arr)
+            yhat[start:end] = Φ_b @ coeffs
 
         return yhat
 
@@ -516,7 +488,7 @@ class SpectralPathRegressor:
         self,
         G_tr: Array,
         b_tr: Array,
-        theta_val: Array,
+        θ_val: Array,
         y_val: Array,
         paths: Sequence[MVec],
     ) -> float:
@@ -547,7 +519,7 @@ class SpectralPathRegressor:
         for lam in self.lambda_grid:
             w = solve_for_coeffs(lam)
             y_val_hat = self._stream_predict(
-                theta=theta_val, coeffs=w, p_mat=p_mat, r_arr=r_arr
+                θ=θ_val, coeffs=w, p_mat=p_mat, r_arr=r_arr
             )
             _, r2v = _metrics(y_val, y_val_hat)
             if r2v > best_r2:
@@ -557,7 +529,7 @@ class SpectralPathRegressor:
         return best_lam
 
     def _select_paths_and_lambda(
-        self, theta_tr: Array, y_tr: Array, theta_val: Array, y_val: Array,
+        self, θ_tr: Array, y_tr: Array, θ_val: Array, y_val: Array,
     ) -> Tuple[List[MVec], float, Stats]:
         """Greedily select k-sparse path features."""
         t0 = time.perf_counter()
@@ -571,7 +543,7 @@ class SpectralPathRegressor:
         no_improve_count = 0
         stopped_early = False
         current_block_size = self.block_size
-        Ntr: int = theta_tr.shape[0]
+        Ntr: int = θ_tr.shape[0]
         G_old = np.array([[Ntr]], dtype=float)
         b_old = np.array([float(y_tr.sum())], dtype=float)
 
@@ -588,7 +560,7 @@ class SpectralPathRegressor:
 
             # Generate "old" data
             if not selected_paths:
-                p_mat_old = np.empty((0, theta_tr.shape[1]))
+                p_mat_old = np.empty((0, θ_tr.shape[1]))
                 r_arr_old = np.empty((0,), dtype=np.int64)
             else:
                 p_mat_old, r_arr_old = _path_matrix_and_r_arr(selected_paths)
@@ -601,7 +573,7 @@ class SpectralPathRegressor:
 
             # Loop through training data batch by batch to build C, G, and b
             C_map, Gnew_map, bnew_map = self._build_c_g_and_b_via_stream(
-                y_tr, theta_tr, p_mat_old, r_arr_old, cand_struct,
+                y_tr, θ_tr, p_mat_old, r_arr_old, cand_struct,
                 C_map, Gnew_map, bnew_map
             )
 
@@ -639,7 +611,7 @@ class SpectralPathRegressor:
                             )
                             normalized_coeffs = scaled_coeffs * inv_s_trial
                             y_val_hat = self._stream_predict(
-                                theta_val, normalized_coeffs, p_mat_trial, r_arr_trial
+                                θ_val, normalized_coeffs, p_mat_trial, r_arr_trial
                             )
                             _, r2v = _metrics(y_val, y_val_hat)
                             if r2v > best_r2_this:
@@ -652,7 +624,7 @@ class SpectralPathRegressor:
                                 evals_trial, U_trial, b_trial, lambda_
                             )
                             y_val_hat = self._stream_predict(
-                                theta_val, coeffs, p_mat_trial, r_arr_trial
+                                θ_val, coeffs, p_mat_trial, r_arr_trial
                             )
                             _, r2v = _metrics(y_val, y_val_hat)
                             if r2v > best_r2_this:
@@ -664,7 +636,7 @@ class SpectralPathRegressor:
                 else:
                     coeffs = self._solve_normal_eqn(G_trial, b_trial, lambda_star)
                     y_val_hat = self._stream_predict(
-                        theta_val, coeffs, p_mat_trial, r_arr_trial
+                        θ_val, coeffs, p_mat_trial, r_arr_trial
                     )
                     _, cand_r2_score = _metrics(y_val, y_val_hat)
                     cand_lambda = lambda_star
@@ -696,17 +668,13 @@ class SpectralPathRegressor:
                 no_improve_count += 1
 
                 # Given we're not improving, decrease block size if allowed
-                if (
-                    current_block_size > self.min_block_size
-                    and self.adaptive_block_size
-                    ):
+                if current_block_size > self.min_block_size and self.adaptive_block_size:
                     current_block_size=max(self.min_block_size, current_block_size - 1)
 
                 if no_improve_count >= self.early_stopping_patience:
                     self._log(
-                        f"[Early stopping] No improvement for "
-                        f"{self.early_stopping_patience} rounds at "
-                        f"{len(selected_paths)} paths"
+                        f"[Early stopping] No improvement for {self.early_stopping_patience} "
+                        f"rounds at {len(selected_paths)} paths"
                     )
                     stopped_early = True
                     break
@@ -722,18 +690,17 @@ class SpectralPathRegressor:
         # Optional re-sweep
         if self.final_lambda_refit and len(self.lambda_grid) > 0:
             lambda_star = self._select_lambda_from_gram(
-                G_old, b_old, theta_val, y_val, selected_paths
+                G_old, b_old, θ_val, y_val, selected_paths
             )
         t1 = time.perf_counter()
 
         stats = Stats(stopped_early=stopped_early, history=history, time_taken=t1-t0)
         return selected_paths, lambda_star, stats
 
-    # ------------------- Misc -------------------
     def _build_c_g_and_b_via_stream(
         self,
         y_tr: Array,
-        theta_tr: Array,
+        θ_tr: Array,
         p_mat_old: Array,
         r_arr_old: Array,
         cand_struct: Dict[int, Tuple[Array, Array]],
@@ -741,32 +708,33 @@ class SpectralPathRegressor:
         Gnew_map: Dict[int, Array],
         bnew_map: Dict[int, Array]
     ) -> tuple[Dict[int, Array], Dict[int, Array], Dict[int, Array]]:
-        Ntr = theta_tr.shape[0]
+        Ntr = θ_tr.shape[0]
         for start in range(0, Ntr, self.batch_rows):
             end = min(Ntr, start + self.batch_rows)
 
             y_batch = self._batch(y_tr, start, end)
-            theta_batch = self._batch(theta_tr, start, end)
-            Phi_old_batch = _build_feature_matrix(theta_batch, p_mat_old, r_arr_old)
+            θ_batch = self._batch(θ_tr, start, end)
+            Φ_old_batch = _build_feature_matrix(θ_batch, p_mat_old, r_arr_old)
 
             # Loop through k values, e.g., 1, 2, 3
             for k, (p_mat_block, r_arr_block) in cand_struct.items():
-                Phi_new_batch = _build_feature_matrix(
-                    theta_batch, p_mat_block, r_arr_block, False
+                Φ_new_batch = _build_feature_matrix(
+                    θ_batch, p_mat_block, r_arr_block, False
                 )
 
-                C_map[k] += Phi_old_batch.T @ Phi_new_batch
-                Gnew_map[k] += Phi_new_batch.T @ Phi_new_batch
-                bnew_map[k] += Phi_new_batch.T @ y_batch
+                C_map[k] += Φ_old_batch.T @ Φ_new_batch
+                Gnew_map[k] += Φ_new_batch.T @ Φ_new_batch
+                bnew_map[k] += Φ_new_batch.T @ y_batch
 
         return C_map, Gnew_map, bnew_map
+
     def _log(self, message: str) -> None:
         if self.verbose:
             print(message)
 
-    def _batch(self, theta_tr: Array, start: int, end: int) -> Array:
+    def _batch(self, θ_tr: Array, start: int, end: int) -> Array:
         """Batching helper."""
-        return theta_tr[start:end].astype(
+        return θ_tr[start:end].astype(
             np.float32 if self.use_float32 else np.float64, copy=False
         )
 

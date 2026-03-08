@@ -6,8 +6,24 @@ from typing import List, Sequence, Tuple
 import numpy as np
 from numba import njit
 from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split as tts
 
 from spectral_paths.types import PR, Array, MVec
+
+
+def train_test_split(
+    X: Array, y: Array, test_size: float, random_state: int = 42
+) -> Tuple[Array, Array, Array, Array]:
+    """Sklearn warpper."""
+    split = tts(X, y, test_size=test_size, random_state=random_state)
+    assert len(split) == 4, "Expected sklearn train_test_split to return 4 arrays."
+    X_tr, X_test, y_tr, y_test = split
+    return (
+        np.asarray(X_tr),
+        np.asarray(X_test),
+        np.asarray(y_tr),
+        np.asarray(y_test),
+    )
 
 
 def check_dimensions(X: Array, y: Array) -> None:
