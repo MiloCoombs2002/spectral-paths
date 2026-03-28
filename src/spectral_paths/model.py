@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import time
 from itertools import combinations
-from typing import Dict, Iterator, List, Sequence, Tuple, cast
+from typing import Dict, Iterator, List, Sequence, Tuple
 
 import numpy as np
 from sklearn.metrics import r2_score
@@ -244,8 +244,8 @@ class SpectralPathRegressor:
         self._compute_feature_importance(θ_tr, y_tr)
         paths, lambda_star, stats = self._select_paths_and_lambda(θ_tr, y_tr, θ_val, y_val)
 
-        θ_all = cast(Array, np.vstack([θ_tr, θ_val]))
-        y_all = cast(Array, np.concatenate([y_tr, y_val]))
+        θ_all = np.vstack([θ_tr, θ_val])
+        y_all =  np.concatenate([y_tr, y_val])
         solve_time, coefficients = self._calculate_coeffs(θ_all, y_all, paths, lambda_star)
 
         self._save_learned_state(paths, lambda_star, coefficients)
