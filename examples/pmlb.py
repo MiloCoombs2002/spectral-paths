@@ -29,7 +29,7 @@ datasets: list[dict[str, str]] = [
 if __name__ == "__main__":
     for dataset in datasets:
 
-        print(f"Dataset: {dataset["name"]}")
+        print(f"Dataset: {dataset["name"]}", end="")
         # Fetch data as a pandas DataFrame
         df = fetch_data(dataset["pmlb_name"], return_X_y=False)
 
@@ -42,28 +42,22 @@ if __name__ == "__main__":
             X, y, test_size=0.20, random_state=42
         )
 
+        print(f". Training rows {X_tr.shape[0]}")
+
         D = X.shape[1]
 
         mdl = SpectralPathRegressor(
-            max_paths=10*D,
+            max_paths=512,
             block_size=1 * D,
             lambda_grid=list(np.logspace(-5, -1, 25)),
             l_max=None,
             scaler_type="robust_tanh",
             bound_percentiles=(5, 95),
-            batch_rows=2048,
             verbose=verbose,
-            random_state=42,
-            val_size=0.25,
-            final_lambda_refit=True,
-            normalize_columns=True,
-            normalize_intercept=False,
-            k_values=(1,2,3),
+            k_values=(1,2,3,4),
             early_stopping_patience=5,
             early_stopping_tol= 1e-5,
-            adaptive_block_size=True,
-            min_block_size=1,
-            use_importance_ordering=True,
+            greedy_subsample=5000
         )
         if extra_verbose:
             print("Training model...")

@@ -9,7 +9,7 @@ from sklearn.model_selection import train_test_split
 
 from spectral_paths.model import SpectralPathRegressor
 
-verbose = True
+verbose = False
 extra_verbose = False
 
 class DatasetSpec(TypedDict):
@@ -57,26 +57,16 @@ if __name__ == "__main__":
         D = X.shape[1]
 
         mdl = SpectralPathRegressor(
-            max_paths=30*D if dataset["openml_name"] !="Cancer_Drug_Response" else 3*D,
+            max_paths=512,
             block_size=1 * D,
             lambda_grid=list(np.logspace(-5, -1, 25)),
             l_max=None,
             scaler_type="robust_tanh",
             bound_percentiles=(5, 95),
-            batch_rows=2048,
             verbose=verbose,
-            random_state=42,
-            val_size=0.25,
-            final_lambda_refit=True,
-            normalize_columns=True,
-            normalize_intercept=False,
             k_values=(1,2,3,4),
-            # New improved parameters
             early_stopping_patience=5,
-            early_stopping_tol= 1e-5,
-            adaptive_block_size=True,
-            min_block_size=1,
-            use_importance_ordering=True,
+            early_stopping_tol= 1e-3,
         )
         if extra_verbose:
             print("Training model...")

@@ -52,6 +52,7 @@ class SpectralPathRegressor:
         use_float32: bool = False,
         early_stopping_patience: int = 3,
         early_stopping_tol: float = 1e-4,
+        greedy_subsample: float | int | None = None,
 
         # -------- scaler config --------
         scaler_type: ScalerType | str = ScalerType.STANDARD_PERCENTILE_MINMAX,
@@ -95,6 +96,10 @@ class SpectralPathRegressor:
                 tolerated before early stopping of greedy path selection.
             early_stopping_tol (float): Minimum validation improvement required to reset
                 early stopping.
+            greedy_subsample (float | int | None): Optional subsample size used for
+                greedy path evaluation on the training split. Floats are interpreted
+                as fractions in (0, 1], integers as sample counts, and None uses the
+                full training data.
             scaler_type (ScalerType | str): Scaling strategy used to map inputs to
                 the interval [-1, 1] prior to the angular transformation.
             iqr_percentile_range (Tuple[float, float]): Lower and upper percentiles used
@@ -136,6 +141,17 @@ class SpectralPathRegressor:
         self.use_float32 = bool(use_float32)
         self.early_stopping_patience = int(early_stopping_patience)
         self.early_stopping_tol = float(early_stopping_tol)
+        self.greedy_subsample = greedy_subsample
+
+        if greedy_subsample is not None:
+            if isinstance(greedy_subsample, float):
+                if not (0.0 < greedy_subsample <= 1.0):
+                    raise ValueError("greedy_subsample float values must lie in (0, 1].")
+            elif isinstance(greedy_subsample, int):
+                if greedy_subsample < 1:
+                    raise ValueError("greedy_subsample integer values must be >= 1.")
+            else:
+                raise ValueError("greedy_subsample must be a float, int, or None.")
 
         try:
             self.scaler_type = ScalerType(scaler_type)
@@ -223,6 +239,28 @@ class SpectralPathRegressor:
         t3 = time.perf_counter()
         return t3-t2, coefficients
 
+    def _subsample_greedy_training_data(self, θ_tr: Array, y_tr: Array) -> tuple[Array, Array]:
+        """Optionally subsample training data for greedy path evaluation."""
+        if self.greedy_subsample is None:
+            return θ_tr, y_tr
+
+        n_train = θ_tr.shape[0]
+        if isinstance(self.greedy_subsample, int):
+            sample_size = min(self.greedy_subsample, n_train)
+        else:
+            sample_size = min(n_train, max(1, int(np.ceil(self.greedy_subsample * n_train))))
+
+        if sample_size >= n_train:
+            return θ_tr, y_tr
+
+        rng = np.random.default_rng(self.random_state)
+        indices = np.sort(rng.choice(n_train, size=sample_size, replace=False))
+        self._log(
+            f"[Greedy] Using training subsample of {sample_size}/{n_train} rows "
+            "for candidate evaluation"
+        )
+        return θ_tr[indices], y_tr[indices]
+
     def fit(
         self, X: Array, y: Array, *, X_val: Array | None = None, y_val: Array | None = None
     ) -> "SpectralPathRegressor":
@@ -242,7 +280,10 @@ class SpectralPathRegressor:
         θ_tr, θ_val = self._transform_data(X_tr, X_val)
 
         self._compute_feature_importance(θ_tr, y_tr)
-        paths, lambda_star, stats = self._select_paths_and_lambda(θ_tr, y_tr, θ_val, y_val)
+        θ_tr_greedy, y_tr_greedy = self._subsample_greedy_training_data(θ_tr, y_tr)
+        paths, lambda_star, stats = self._select_paths_and_lambda(
+            θ_tr_greedy, y_tr_greedy, θ_val, y_val
+        )
 
         θ_all = np.vstack([θ_tr, θ_val])
         y_all =  np.concatenate([y_tr, y_val])
