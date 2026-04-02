@@ -74,7 +74,7 @@ def main() -> None:
             scaler_type="robust_tanh",
             bound_percentiles=(5, 95),
             verbose=False,
-            k_values=(1,),
+            k_values=(1,2,3,4),
             early_stopping_patience=5,
             early_stopping_tol=1e-5,
             greedy_subsample=GREEDY_SUBSAMPLE,

@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import os
 import time
-from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from itertools import combinations
 from typing import Callable, Dict, Iterator, List, Literal, Sequence, Tuple, TypedDict
 
