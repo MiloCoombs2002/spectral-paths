@@ -1,8 +1,8 @@
 [tool.poetry]
 name = "spectral-paths"
 version = "0.1.0"
-description = ""
-authors = ["Milo Coombs2002 <milo.coombs7@gmail.com>"]
+description = "Spectral-path regression with greedy sparse dictionary selection."
+authors = ["Milo Coombs <milo.coombs7@gmail.com>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
@@ -22,7 +22,6 @@ mypy = "^1.19.1"
 requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
 
-# You can keep your mypy and ruff sections as they are
 [tool.mypy]
 ignore_missing_imports = true
 

@@ -873,7 +873,7 @@ class SpectralPathRegressor:
             y_b = y[start:end]
 
             G += Φ_b.T @ Φ_b
-            b += Φ_b.T @ y_b
+            b = b + np.asarray(Φ_b.T @ y_b, dtype=self._internal_dtype)
 
         return G, b
 

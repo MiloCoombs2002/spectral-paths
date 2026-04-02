@@ -1,6 +1,6 @@
 # spectral-paths
 
-Spectral-path regression in Python. This project provides a `SpectralPathRegressor` model that builds spectral path features, selects a sparse dictionary with a greedy procedure, and fits ridge-style coefficients with optional early stopping and final refit. It uses directioanl harmonics to approximate teh target as a smooth function and is inspired by Chebyshev polynomials.
+Spectral-path regression in Python. This project provides a `SpectralPathRegressor` model that builds spectral path features, selects a sparse dictionary with a greedy procedure, and fits ridge-style coefficients with optional early stopping and final refit. It uses directional harmonics to approximate the target as a smooth function and is inspired by Chebyshev polynomials.
 
 ## Features
 - Spectral-path feature construction with configurable sparsity (`k_values`).

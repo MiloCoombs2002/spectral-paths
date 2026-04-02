@@ -13,7 +13,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, TypedDict, cast
+from typing import Callable, Literal, Protocol, TypedDict
 
 import numpy as np
 from pandas import DataFrame
@@ -21,6 +21,8 @@ from sklearn.metrics import r2_score
 from sklearn.model_selection import train_test_split
 
 from spectral_paths.model import SpectralPathRegressor
+
+BlasThreadPolicy = Literal["auto", "none", "single", "manual"]
 
 
 @dataclass(frozen=True)
@@ -30,7 +32,7 @@ class BenchmarkCase:
     name: str
     use_float32: bool
     lambda_parallel_workers: int
-    blas_thread_policy: str
+    blas_thread_policy: BlasThreadPolicy
 
 
 @dataclass(frozen=True)
@@ -74,6 +76,12 @@ class UCIData:
 
     features: DataFrame
     targets: DataFrame
+
+
+class UCIDatasetLike(Protocol):
+    """Minimal protocol for fetched UCI dataset objects."""
+
+    data: UCIData
 
 
 OPENML_DATASETS: dict[str, OpenMLSpec] = {
@@ -148,9 +156,9 @@ def _load_pmlb_dataset(dataset_key: str) -> tuple[str, np.ndarray, np.ndarray]:
     return spec["label"], X, y
 
 
-def _to_numpy_features_and_target(dataset: object) -> tuple[np.ndarray, np.ndarray]:
+def _to_numpy_features_and_target(dataset: UCIDatasetLike) -> tuple[np.ndarray, np.ndarray]:
     """Convert a fetched UCI dataset object to numpy arrays."""
-    data = cast(UCIData, dataset.data) # type: ignore[attr-defined]
+    data = dataset.data
     X = np.asarray(data.features, dtype=float)
     y_raw = data.targets
 
@@ -268,7 +276,7 @@ def make_model(
     mode: str,
     use_float32: bool,
     lambda_parallel_workers: int,
-    blas_thread_policy: str,
+    blas_thread_policy: BlasThreadPolicy,
 ) -> SpectralPathRegressor:
     """Create the model used across benchmark runs."""
     config = model_config_for(provider, mode)
@@ -302,7 +310,7 @@ def run_once(
     mode: str,
     use_float32: bool,
     lambda_parallel_workers: int,
-    blas_thread_policy: str,
+    blas_thread_policy: BlasThreadPolicy,
 ) -> dict[str, float]:
     """Fit and score one model instance."""
     X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -368,7 +376,8 @@ def run_case(dataset_choice: str, mode: str, case: BenchmarkCase) -> None:
         f"{label:>32} | {case.name:>20} | "
         f"cold={cold['wall_sec']:.3f}s warm={warm['wall_sec']:.3f}s | "
         f"paths={warm['selected_count']:.0f} λ={warm['lambda_star']:.5f} "
-        f"blas={int(warm['resolved_blas_threads']) if warm['resolved_blas_threads'] >= 0 else 'sys'} | "
+        "blas="
+        f"{int(warm['resolved_blas_threads']) if warm['resolved_blas_threads'] >= 0 else 'sys'} | "
         f"val_r2={warm['val_r2']:.4f} test_r2={warm['test_r2']:.4f}"
     )
 
