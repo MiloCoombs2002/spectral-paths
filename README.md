@@ -33,7 +33,7 @@ y = X[:, 0] * 2.0 - X[:, 1] + rng.normal(scale=0.1, size=500)
 
 D = X.shape[1]
 model = SpectralPathRegressor(
-    total_cols=30 * D,
+    max_paths=30 * D,
     block_size=1 * D,
     lambda_grid=np.logspace(-5, -1, 25),
     scaler_type="robust_tanh",
@@ -54,6 +54,7 @@ preds = model.predict(X)
 ## Examples
 - OpenML datasets: `examples/openml.py`
 - PMLB datasets: `examples/pmlb.py`
+- Local CPU benchmark: `examples/benchmark_cpu.py`
 
 Run an example with:
 
@@ -62,6 +63,27 @@ python examples/openml.py
 ```
 
 Note: OpenML and PMLB examples download datasets over the network.
+
+Run the local benchmark with:
+
+```bash
+python examples/benchmark_cpu.py
+```
+
+## Performance notes
+- The model now records phase-level timings in `model.fit_report_.phase_timings`.
+- The fit report also records resolved BLAS policy info in
+  `model.fit_report_.blas_threads`.
+- `lambda_parallel_workers` controls optional outer-thread parallelism for lambda
+  scoring. The default is `1`, which keeps lambda scoring sequential.
+- `blas_thread_policy` now defaults to `"auto"`, which uses a width-focused
+  heuristic to cap BLAS threads for heavier fits.
+- `blas_thread_policy="single"` is the recommended reproducibility/debug fallback.
+- Environment variables such as `OMP_NUM_THREADS`, `MKL_NUM_THREADS`,
+  `OPENBLAS_NUM_THREADS`, and `NUMBA_NUM_THREADS` still affect behavior outside the
+  fit-scoped BLAS limit and can still influence overall performance.
+- Avoid stacking BLAS multithreading with `lambda_parallel_workers > 1` unless you
+  have benchmarked that combination on your machine.
 
 ## Project layout
 - `src/spectral_paths/model.py`: `SpectralPathRegressor` implementation.

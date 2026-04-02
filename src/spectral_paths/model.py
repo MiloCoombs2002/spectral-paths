@@ -5,14 +5,18 @@ This module implements the `SpectralPathRegressor` model.
 """
 from __future__ import annotations
 
+import os
 import time
+from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor
 from itertools import combinations
-from typing import Dict, Iterator, List, Sequence, Tuple, TypedDict
+from typing import Callable, Dict, Iterator, List, Literal, Sequence, Tuple, TypedDict
 
 import numpy as np
 from sklearn.metrics import r2_score
+from threadpoolctl import threadpool_limits
 
-from spectral_paths.schemas import FitReport, ScalerType, Stats
+from spectral_paths.schemas import BlasThreadInfo, FitReport, PhaseTimings, ScalerType, Stats
 from spectral_paths.types import Array, MVec
 from spectral_paths.utils.helpers import (
     _build_feature_matrix,
@@ -31,6 +35,17 @@ class EquationTerm(TypedDict):
     path: MVec
     coef: float
     energy: float
+
+
+class CandidateEvaluation(TypedDict):
+    """Typed representation of one greedy candidate-block evaluation."""
+
+    k: int
+    paths: List[MVec]
+    G_trial: Array
+    b_trial: Array
+    cand_lambda: float
+    cand_r2_score: float
 
 
 class SpectralPathRegressor:
@@ -58,6 +73,9 @@ class SpectralPathRegressor:
         normalize_intercept: bool = False,
         eps_col_norm: float = 1e-12,
         use_float32: bool = False,
+        lambda_parallel_workers: int = 1,
+        blas_thread_policy: Literal["auto", "none", "single", "manual"] = "auto",
+        blas_threads: int | None = None,
         early_stopping_patience: int = 3,
         early_stopping_tol: float = 1e-4,
         greedy_subsample: float | int | None = None,
@@ -100,6 +118,16 @@ class SpectralPathRegressor:
             eps_col_norm (float): Small constant used to stabilise column normalisation.
             use_float32 (bool): Whether to use float32 arithmetic internally instead of
                 float64.
+            lambda_parallel_workers (int): Number of threads used for lambda scoring
+                after a shared eigendecomposition. Values <= 1 disable outer
+                parallelism to avoid nested oversubscription by default.
+            blas_thread_policy (Literal["auto", "none", "single", "manual"]):
+                Policy controlling BLAS/OpenMP thread limits during fit-time hot paths.
+                ``"auto"`` resolves from workload shape, ``"none"`` leaves threadpools
+                untouched, ``"single"`` forces one BLAS thread, and ``"manual"``
+                requires `blas_threads`.
+            blas_threads (int | None): Explicit BLAS thread cap used when
+                `blas_thread_policy="manual"`.
             early_stopping_patience (int): Number of consecutive non-improving rounds
                 tolerated before early stopping of greedy path selection.
             early_stopping_tol (float): Minimum validation improvement required to reset
@@ -147,9 +175,28 @@ class SpectralPathRegressor:
         self.normalize_intercept = bool(normalize_intercept)
         self.eps_col_norm = float(eps_col_norm)
         self.use_float32 = bool(use_float32)
+        self.lambda_parallel_workers = int(lambda_parallel_workers)
+        self.blas_thread_policy = str(blas_thread_policy)
+        self.blas_threads = None if blas_threads is None else int(blas_threads)
         self.early_stopping_patience = int(early_stopping_patience)
         self.early_stopping_tol = float(early_stopping_tol)
         self.greedy_subsample = greedy_subsample
+        self._internal_dtype = np.float32 if self.use_float32 else np.float64
+        self._resolved_blas_threads_: int | None = None
+
+        if self.lambda_parallel_workers < 1:
+            raise ValueError("lambda_parallel_workers must be >= 1.")
+        if self.blas_thread_policy not in {"auto", "none", "single", "manual"}:
+            raise ValueError(
+                "blas_thread_policy must be one of 'auto', 'none', 'single', or 'manual'."
+            )
+        if self.blas_thread_policy == "manual":
+            if self.blas_threads is None or self.blas_threads < 1:
+                raise ValueError(
+                    "blas_threads must be a positive integer when blas_thread_policy='manual'."
+                )
+        elif self.blas_threads is not None and self.blas_threads < 1:
+            raise ValueError("blas_threads must be >= 1 when provided.")
 
         if greedy_subsample is not None:
             if isinstance(greedy_subsample, float):
@@ -220,6 +267,10 @@ class SpectralPathRegressor:
 
         return θ_tr, θ_val
 
+    def _as_internal_dtype(self, arr: Array) -> Array:
+        """Convert arrays once to the model's internal dtype."""
+        return np.asarray(arr, dtype=self._internal_dtype)
+
     def _compute_feature_importance(self, θ_tr: Array, y_tr: Array) -> None:
         """If use_importance_ordering, compute_initial feature importance."""
         if self.use_importance_ordering:
@@ -235,17 +286,20 @@ class SpectralPathRegressor:
 
     def _cache_ray_structures(self, paths: List[MVec]) -> None:
         """Cache ray structures in self to improve inference speed."""
-        self.p_mat_, self.r_arr_ = _path_matrix_and_r_arr(paths)
+        p_mat, r_arr = _path_matrix_and_r_arr(paths)
+        self.p_mat_ = self._as_internal_dtype(p_mat)
+        self.r_arr_ = r_arr
 
     def _calculate_coeffs(
         self, θ: Array, y: Array, paths: List[MVec], lambda_star: float
-    ) -> tuple[float, Array]:
-        """Compute normal equation, solve it, return coefficients + time taken."""
+    ) -> tuple[float, float, Array]:
+        """Compute normal equation, solve it, and return timings plus coefficients."""
         t2 = time.perf_counter()
         gram_matrix, target_col = self._compute_normal_eqn(θ, y, paths)
-        coefficients = self._solve_normal_eqn(gram_matrix, target_col, lambda_star)
         t3 = time.perf_counter()
-        return t3-t2, coefficients
+        coefficients = self._solve_normal_eqn(gram_matrix, target_col, lambda_star)
+        t4 = time.perf_counter()
+        return t3 - t2, t4 - t3, coefficients
 
     def _subsample_greedy_training_data(self, θ_tr: Array, y_tr: Array) -> tuple[Array, Array]:
         """Optionally subsample training data for greedy path evaluation."""
@@ -273,6 +327,7 @@ class SpectralPathRegressor:
         self, X: Array, y: Array, *, X_val: Array | None = None, y_val: Array | None = None
     ) -> "SpectralPathRegressor":
         """Fit the model."""
+        t_fit_start = time.perf_counter()
         X = np.asarray(X)
         y = np.asarray(y, dtype=float).ravel()
         check_dimensions(X,y)
@@ -285,22 +340,49 @@ class SpectralPathRegressor:
             )
 
         X_tr, y_tr, X_val, y_val = self._prepare_train_val_split(X, y, X_val, y_val)
+        t_pre_start = time.perf_counter()
         θ_tr, θ_val = self._transform_data(X_tr, X_val)
+        θ_tr = self._as_internal_dtype(θ_tr)
+        θ_val = self._as_internal_dtype(θ_val)
+        y_tr = self._as_internal_dtype(y_tr)
+        y_val = self._as_internal_dtype(y_val)
+        preprocessing_time = time.perf_counter() - t_pre_start
 
         self._compute_feature_importance(θ_tr, y_tr)
         θ_tr_greedy, y_tr_greedy = self._subsample_greedy_training_data(θ_tr, y_tr)
-        paths, lambda_star, stats = self._select_paths_and_lambda(
-            θ_tr_greedy, y_tr_greedy, θ_val, y_val
+        resolved_blas_threads = self._resolve_blas_threads(θ_tr_greedy.shape[0])
+        self._resolved_blas_threads_ = resolved_blas_threads
+        self._log(
+            "[BLAS] policy="
+            f"{self.blas_thread_policy} resolved_threads={resolved_blas_threads}"
         )
+
+        with self._blas_thread_limit_context(resolved_blas_threads):
+            paths, lambda_star, stats = self._select_paths_and_lambda(
+                θ_tr_greedy, y_tr_greedy, θ_val, y_val
+            )
 
         θ_all = np.vstack([θ_tr, θ_val])
         y_all =  np.concatenate([y_tr, y_val])
-        solve_time, coefficients = self._calculate_coeffs(θ_all, y_all, paths, lambda_star)
+        with self._blas_thread_limit_context(resolved_blas_threads):
+            normal_eqn_time, solve_time, coefficients = self._calculate_coeffs(
+                θ_all, y_all, paths, lambda_star
+            )
 
         self._save_learned_state(paths, lambda_star, coefficients)
         self._cache_ray_structures(paths)
 
         feature_importance = self._compute_feature_importance_from_model()
+
+        phase_timings = PhaseTimings(
+            preprocessing_sec=preprocessing_time,
+            greedy_accumulation_sec=stats.accumulation_time_sec,
+            greedy_scoring_sec=stats.scoring_time_sec,
+            lambda_sweep_sec=stats.lambda_sweep_time_sec,
+            final_normal_eqn_sec=normal_eqn_time,
+            final_solve_sec=solve_time,
+            total_fit_sec=time.perf_counter() - t_fit_start,
+        )
 
         self.fit_report_ = FitReport(
             lambda_star=lambda_star,
@@ -310,6 +392,11 @@ class SpectralPathRegressor:
             history=stats.history,
             stopped_early=stats.stopped_early,
             feature_importance=feature_importance,
+            phase_timings=phase_timings,
+            blas_threads=BlasThreadInfo(
+                policy=self.blas_thread_policy,
+                resolved_threads=resolved_blas_threads,
+            ),
         )
 
         return self
@@ -327,7 +414,7 @@ class SpectralPathRegressor:
         if self.transformer_ is None:
             raise ValueError("Transformer has not been fitted yet")
 
-        θ = self.transformer_.transform(X)
+        θ = self._as_internal_dtype(self.transformer_.transform(X))
         yhat = self._stream_predict(θ)
         return yhat
 
@@ -642,9 +729,7 @@ class SpectralPathRegressor:
         return lines
 
     def print_feature_transforms(
-        self,
-        *,
-        feature_names: Sequence[str] | None = None,
+        self, *, feature_names: Sequence[str] | None = None,
     ) -> List[str]:
         """Print the fitted per-feature preprocessing transforms."""
         lines = self.format_feature_transforms(feature_names=feature_names)
@@ -772,11 +857,12 @@ class SpectralPathRegressor:
             - `b` has shape (M,).
         """
         path_matrix, orders = _path_matrix_and_r_arr(paths)
+        path_matrix = self._as_internal_dtype(path_matrix)
         M = 1 + len(paths)
 
         # Initialize Gram matrix and target cold as empty arrays
-        G = np.zeros((M, M), dtype=float)
-        b = np.zeros(M, dtype=float)
+        G = np.zeros((M, M), dtype=self._internal_dtype)
+        b = np.zeros(M, dtype=self._internal_dtype)
 
         N = θ.shape[0]
         for start in range(0, N, self.batch_rows):
@@ -821,6 +907,90 @@ class SpectralPathRegressor:
 
         return yhat
 
+    def _blas_thread_env_active(self) -> bool:
+        """Return whether common BLAS thread env vars are set above one thread."""
+        for env_name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+            raw = os.environ.get(env_name)
+            if raw is None:
+                continue
+            try:
+                if int(raw) > 1:
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    def _outer_parallelism_enabled(self) -> bool:
+        """Decide whether outer Python thread parallelism should be used."""
+        if self.lambda_parallel_workers <= 1:
+            return False
+        if len(self.lambda_grid) <= 1:
+            return False
+        if self._resolved_blas_threads_ is not None and self._resolved_blas_threads_ > 1:
+            return False
+        return not self._blas_thread_env_active()
+
+    def _resolve_blas_threads(self, n_train_rows: int) -> int | None:
+        """Resolve BLAS thread cap from policy and workload shape."""
+        if self.blas_thread_policy == "none":
+            return None
+        if self.blas_thread_policy == "single":
+            return 1
+        if self.blas_thread_policy == "manual":
+            assert self.blas_threads is not None
+            return self.blas_threads
+
+        assert self.n_features_in_ is not None
+        width = self.n_features_in_
+        max_paths = self.max_paths
+        lambda_count = len(self.lambda_grid)
+
+        # Width-dominated heuristic derived from benchmark results in this repo.
+        if width >= 16:
+            return 1
+        if max_paths >= 256 and lambda_count >= 16:
+            return 1
+        if width >= 8 and max_paths >= 512:
+            return 1
+        if width >= 12 and n_train_rows >= 4000:
+            return 1
+        return None
+
+    def _blas_thread_limit_context(self, resolved_threads: int | None):
+        """Return a context manager that optionally caps BLAS threads."""
+        if resolved_threads is None:
+            return nullcontext()
+        return threadpool_limits(limits=resolved_threads, user_api="blas")
+
+    def _score_lambda_candidates(
+        self,
+        solve_for_coeffs: Callable[[float], Array],
+        p_mat: Array,
+        r_arr: Array,
+        θ_val: Array,
+        y_val: Array,
+    ) -> tuple[float, float, float]:
+        """Score all lambda candidates and return best lambda, score, and sweep time."""
+
+        def evaluate_one(lam: float) -> tuple[float, float]:
+            coeffs = solve_for_coeffs(lam)
+            y_val_hat = self._stream_predict(
+                θ=θ_val, coeffs=coeffs, p_mat=p_mat, r_arr=r_arr
+            )
+            _, r2v = _metrics(y_val, y_val_hat)
+            return lam, r2v
+
+        t0 = time.perf_counter()
+        if self._outer_parallelism_enabled():
+            max_workers = min(self.lambda_parallel_workers, len(self.lambda_grid))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                results = list(executor.map(evaluate_one, self.lambda_grid))
+        else:
+            results = [evaluate_one(lam) for lam in self.lambda_grid]
+
+        best_lam, best_r2 = max(results, key=lambda item: (item[1], -item[0]))
+        return float(best_lam), float(best_r2), time.perf_counter() - t0
+
     def _select_lambda_from_gram(
         self,
         G_tr: Array,
@@ -829,11 +999,9 @@ class SpectralPathRegressor:
         y_val: Array,
         paths: Sequence[MVec],
     ) -> float:
-        best_r2 = -1e18
-        best_lam = self.lambda_grid[0]
-
         # Precompute structures once for validation prediction speed
         p_mat, r_arr = _path_matrix_and_r_arr(paths)
+        p_mat = self._as_internal_dtype(p_mat)
 
         # Cache eigendecomp for lambda sweep
         if self.normalize_columns:
@@ -853,16 +1021,13 @@ class SpectralPathRegressor:
             def solve_for_coeffs(lam_val: float) -> Array:
                 return self._ridge_solve_for_coeffs(evals, U, b_tr, lam_val)
 
-        for lam in self.lambda_grid:
-            w = solve_for_coeffs(lam)
-            y_val_hat = self._stream_predict(
-                θ=θ_val, coeffs=w, p_mat=p_mat, r_arr=r_arr
-            )
-            _, r2v = _metrics(y_val, y_val_hat)
-            if r2v > best_r2:
-                best_r2 = r2v
-                best_lam = lam
-
+        best_lam, _, _ = self._score_lambda_candidates(
+            solve_for_coeffs=solve_for_coeffs,
+            p_mat=p_mat,
+            r_arr=r_arr,
+            θ_val=θ_val,
+            y_val=y_val,
+        )
         return best_lam
 
     def _select_paths_and_lambda(
@@ -870,6 +1035,9 @@ class SpectralPathRegressor:
     ) -> Tuple[List[MVec], float, Stats]:
         """Greedily select k-sparse path features."""
         t0 = time.perf_counter()
+        accumulation_time = 0.0
+        scoring_time = 0.0
+        lambda_sweep_time = 0.0
 
         # Set up
         generators = {k: self._path_generator(k) for k in self.k_values}
@@ -897,10 +1065,11 @@ class SpectralPathRegressor:
 
             # Generate "old" data
             if not selected_paths:
-                p_mat_old = np.empty((0, θ_tr.shape[1]))
+                p_mat_old = np.empty((0, θ_tr.shape[1]), dtype=self._internal_dtype)
                 r_arr_old = np.empty((0,), dtype=np.int64)
             else:
                 p_mat_old, r_arr_old = _path_matrix_and_r_arr(selected_paths)
+                p_mat_old = self._as_internal_dtype(p_mat_old)
             M_old = 1 + len(selected_paths)
 
             # Generate maps & candidate structures
@@ -909,82 +1078,46 @@ class SpectralPathRegressor:
             )
 
             # Loop through training data batch by batch to build C, G, and b
+            t_accum_start = time.perf_counter()
             C_map, Gnew_map, bnew_map = self._build_c_g_and_b_via_stream(
                 y_tr, θ_tr, p_mat_old, r_arr_old, cand_struct,
                 C_map, Gnew_map, bnew_map
             )
+            accumulation_time += time.perf_counter() - t_accum_start
 
             # Evaluate candidates (solve on train using block Gram; score on val)
             best_r2_score = -1e18
-            best_choice = None
+            best_choice: CandidateEvaluation | None = None
 
+            t_score_start = time.perf_counter()
             for k, paths in candidates.items():
-                C = C_map[k]
-                Gnew = Gnew_map[k]
-                bnew = bnew_map[k]
+                candidate_eval, candidate_lambda_sweep = self._evaluate_candidate_block(
+                    k=k,
+                    paths=paths,
+                    selected_paths=selected_paths,
+                    G_old=G_old,
+                    b_old=b_old,
+                    C=C_map[k],
+                    Gnew=Gnew_map[k],
+                    bnew=bnew_map[k],
+                    θ_val=θ_val,
+                    y_val=y_val,
+                    lambda_star=lambda_star,
+                )
+                lambda_sweep_time += candidate_lambda_sweep
 
-                # Build trial data
-                G_trial = np.block([[G_old, C], [C.T,  Gnew]])
-                b_trial = np.concatenate([b_old, bnew])
-                trial_paths = selected_paths + paths
-                p_mat_trial, r_arr_trial = _path_matrix_and_r_arr(trial_paths)
-
-                # Solve (possibly with lambda sweep on first commit)
-                if lambda_star is None:
-                    best_r2_this = -1e18
-                    best_lam_this = self.lambda_grid[0]
-
-                    if self.normalize_columns:
-                        scaling_vector = self._calc_scaling_vector(G_trial)
-                        inv_s_trial = 1.0 / scaling_vector
-                        Gs_trial = (
-                            (inv_s_trial[:, None] * G_trial) * inv_s_trial[None, :]
-                        )
-                        scaled_b_trial = inv_s_trial * b_trial
-                        scaled_evals_trial, U_trial = np.linalg.eigh(Gs_trial)
-                        for lambda_ in self.lambda_grid:
-                            scaled_coeffs = self._ridge_solve_for_coeffs(
-                                scaled_evals_trial, U_trial, scaled_b_trial, lambda_
-                            )
-                            normalized_coeffs = scaled_coeffs * inv_s_trial
-                            y_val_hat = self._stream_predict(
-                                θ_val, normalized_coeffs, p_mat_trial, r_arr_trial
-                            )
-                            _, r2v = _metrics(y_val, y_val_hat)
-                            if r2v > best_r2_this:
-                                best_r2_this = r2v
-                                best_lam_this = lambda_
-                    else:
-                        evals_trial, U_trial = np.linalg.eigh(G_trial)
-                        for lambda_ in self.lambda_grid:
-                            coeffs = self._ridge_solve_for_coeffs(
-                                evals_trial, U_trial, b_trial, lambda_
-                            )
-                            y_val_hat = self._stream_predict(
-                                θ_val, coeffs, p_mat_trial, r_arr_trial
-                            )
-                            _, r2v = _metrics(y_val, y_val_hat)
-                            if r2v > best_r2_this:
-                                best_r2_this = r2v
-                                best_lam_this = lambda_
-
-                    cand_r2_score = best_r2_this
-                    cand_lambda = best_lam_this
-                else:
-                    coeffs = self._solve_normal_eqn(G_trial, b_trial, lambda_star)
-                    y_val_hat = self._stream_predict(
-                        θ_val, coeffs, p_mat_trial, r_arr_trial
-                    )
-                    _, cand_r2_score = _metrics(y_val, y_val_hat)
-                    cand_lambda = lambda_star
-
-                if cand_r2_score > best_r2_score:
-                    best_r2_score = cand_r2_score
-                    best_choice = (k, paths, G_trial, b_trial, cand_lambda)
+                if candidate_eval["cand_r2_score"] > best_r2_score:
+                    best_r2_score = candidate_eval["cand_r2_score"]
+                    best_choice = candidate_eval
+            scoring_time += time.perf_counter() - t_score_start
 
             # Update with new best things
             assert best_choice is not None # (for type checkers)
-            k_win, block_win, G_new_old, b_new_old, lam_win = best_choice
+            k_win = best_choice["k"]
+            block_win = best_choice["paths"]
+            G_new_old = best_choice["G_trial"]
+            b_new_old = best_choice["b_trial"]
+            lam_win = best_choice["cand_lambda"]
             selected_paths.extend(block_win)
             G_old = G_new_old
             b_old = b_new_old
@@ -1026,13 +1159,92 @@ class SpectralPathRegressor:
 
         # Optional re-sweep
         if self.final_lambda_refit and len(self.lambda_grid) > 0:
+            t_lambda_refit_start = time.perf_counter()
             lambda_star = self._select_lambda_from_gram(
                 G_old, b_old, θ_val, y_val, selected_paths
             )
+            lambda_sweep_time += time.perf_counter() - t_lambda_refit_start
         t1 = time.perf_counter()
 
-        stats = Stats(stopped_early=stopped_early, history=history, time_taken=t1-t0)
+        stats = Stats(
+            stopped_early=stopped_early,
+            history=history,
+            time_taken=t1-t0,
+            accumulation_time_sec=accumulation_time,
+            scoring_time_sec=scoring_time,
+            lambda_sweep_time_sec=lambda_sweep_time,
+        )
         return selected_paths, lambda_star, stats
+
+    def _evaluate_candidate_block(
+        self,
+        *,
+        k: int,
+        paths: List[MVec],
+        selected_paths: List[MVec],
+        G_old: Array,
+        b_old: Array,
+        C: Array,
+        Gnew: Array,
+        bnew: Array,
+        θ_val: Array,
+        y_val: Array,
+        lambda_star: float | None,
+    ) -> tuple[CandidateEvaluation, float]:
+        """Evaluate one greedy candidate block and return score metadata."""
+        G_trial = np.block([[G_old, C], [C.T, Gnew]])
+        b_trial = np.concatenate([b_old, bnew])
+        trial_paths = selected_paths + paths
+        p_mat_trial, r_arr_trial = _path_matrix_and_r_arr(trial_paths)
+        p_mat_trial = self._as_internal_dtype(p_mat_trial)
+
+        lambda_sweep_time = 0.0
+        if lambda_star is None:
+            if self.normalize_columns:
+                scaling_vector = self._calc_scaling_vector(G_trial)
+                inv_s_trial = 1.0 / scaling_vector
+                Gs_trial = (inv_s_trial[:, None] * G_trial) * inv_s_trial[None, :]
+                scaled_b_trial = inv_s_trial * b_trial
+                scaled_evals_trial, U_trial = np.linalg.eigh(Gs_trial)
+
+                def solve_for_coeffs(lambda_: float) -> Array:
+                    scaled_coeffs = self._ridge_solve_for_coeffs(
+                        scaled_evals_trial, U_trial, scaled_b_trial, lambda_
+                    )
+                    return scaled_coeffs * inv_s_trial
+
+            else:
+                evals_trial, U_trial = np.linalg.eigh(G_trial)
+
+                def solve_for_coeffs(lambda_: float) -> Array:
+                    return self._ridge_solve_for_coeffs(
+                        evals_trial, U_trial, b_trial, lambda_
+                    )
+
+            cand_lambda, cand_r2_score, lambda_sweep_time = self._score_lambda_candidates(
+                solve_for_coeffs=solve_for_coeffs,
+                p_mat=p_mat_trial,
+                r_arr=r_arr_trial,
+                θ_val=θ_val,
+                y_val=y_val,
+            )
+        else:
+            coeffs = self._solve_normal_eqn(G_trial, b_trial, lambda_star)
+            y_val_hat = self._stream_predict(θ_val, coeffs, p_mat_trial, r_arr_trial)
+            _, cand_r2_score = _metrics(y_val, y_val_hat)
+            cand_lambda = lambda_star
+
+        return (
+            CandidateEvaluation(
+                k=k,
+                paths=paths,
+                G_trial=G_trial,
+                b_trial=b_trial,
+                cand_lambda=float(cand_lambda),
+                cand_r2_score=float(cand_r2_score),
+            ),
+            lambda_sweep_time,
+        )
 
     def _build_c_g_and_b_via_stream(
         self,
@@ -1049,8 +1261,8 @@ class SpectralPathRegressor:
         for start in range(0, Ntr, self.batch_rows):
             end = min(Ntr, start + self.batch_rows)
 
-            y_batch = self._batch(y_tr, start, end)
-            θ_batch = self._batch(θ_tr, start, end)
+            y_batch = y_tr[start:end]
+            θ_batch = θ_tr[start:end]
             Φ_old_batch = _build_feature_matrix(θ_batch, p_mat_old, r_arr_old)
 
             # Loop through k values, e.g., 1, 2, 3
@@ -1071,9 +1283,7 @@ class SpectralPathRegressor:
 
     def _batch(self, θ_tr: Array, start: int, end: int) -> Array:
         """Batching helper."""
-        return θ_tr[start:end].astype(
-            np.float32 if self.use_float32 else np.float64, copy=False
-        )
+        return θ_tr[start:end]
 
     def _generate_candidates(
         self, generators: Dict[int, Iterator[MVec]], block_size: int
@@ -1114,9 +1324,10 @@ class SpectralPathRegressor:
         Gnew_map: Dict[int, Array] = {}
         bnew_map: Dict[int, Array] = {}
         for k, block in candidates.items():
-            cand_struct[k] = _path_matrix_and_r_arr(block)
+            p_mat_block, r_arr_block = _path_matrix_and_r_arr(block)
+            cand_struct[k] = (self._as_internal_dtype(p_mat_block), r_arr_block)
             Qnew = len(block)
-            C_map[k] = np.zeros((M_old, Qnew), dtype=float)
-            Gnew_map[k] = np.zeros((Qnew, Qnew), dtype=float)
-            bnew_map[k] = np.zeros(Qnew, dtype=float)
+            C_map[k] = np.zeros((M_old, Qnew), dtype=self._internal_dtype)
+            Gnew_map[k] = np.zeros((Qnew, Qnew), dtype=self._internal_dtype)
+            bnew_map[k] = np.zeros(Qnew, dtype=self._internal_dtype)
         return cand_struct, C_map, Gnew_map, bnew_map

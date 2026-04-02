@@ -54,6 +54,7 @@ if __name__ == "__main__":
             X, y, test_size=0.20, random_state=42
         )
 
+        print(f". Training rows {X_tr.shape[0]}. D: {X_tr.shape[1]}")
         D = X.shape[1]
 
         mdl = SpectralPathRegressor(
