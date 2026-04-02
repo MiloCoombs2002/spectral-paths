@@ -131,11 +131,78 @@ class AngularTransformer:
 
         return np.arccos(Xs)
 
+    def transform_with_jacobian(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Return angular features together with the diagonal raw-input Jacobian.
+
+        Because preprocessing is feature-wise, the Jacobian of ``theta`` with respect
+        to the raw inputs is diagonal. The returned array therefore stores only the
+        diagonal entries ``d theta_j / d x_j`` with shape ``(n_samples, n_features)``.
+        """
+        self._check_is_fitted()
+        X = self._as_2d_float(X)
+
+        if X.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f"X has {X.shape[1]} features, expected {self.n_features_in_}."
+            )
+
+        Xs_raw, dXs_dx = self._scale_to_unit_interval_with_jacobian(X)
+
+        if self.clip:
+            inside_clip = (Xs_raw >= -1.0) & (Xs_raw <= 1.0)
+            Xs = np.clip(Xs_raw, -1.0, 1.0)
+            dXs_dx = np.where(inside_clip, dXs_dx, 0.0)
+        else:
+            Xs = Xs_raw
+
+        # theta = arccos(z), so dtheta/dx = -(dz/dx) / sqrt(1 - z^2).
+        denom = np.sqrt(np.maximum(1.0 - Xs * Xs, self.eps))
+        dtheta_dx = -dXs_dx / denom
+        return np.arccos(Xs), dtheta_dx
+
     def fit_transform(self, X: np.ndarray, y=None) -> np.ndarray:
         """Fit preprocessing parameters and transform `X` in one pass."""
         return self.fit(X, y).transform(X)
 
     # ---------- Internal methods ----------
+    def _scale_to_unit_interval_with_jacobian(
+        self, X: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Scale features into [-1, 1] and return ``dz/dx`` for each feature."""
+        mode = self._canonical_mode(self.scaler)
+
+        if mode is ScalerType.MINMAX:
+            min_, max_ = self._require_minmax_params()
+            rng = np.maximum(max_ - min_, self.eps)
+            u01 = (X - min_) / rng
+            Xs = 2.0 * u01 - 1.0
+            dXs_dx = np.broadcast_to(2.0 / rng, X.shape).copy()
+            return Xs, dXs_dx
+
+        center, scale = self._require_zscore_params()
+        scale_safe = np.maximum(scale, self.eps)
+        z = (X - center) / scale_safe
+
+        if mode in (ScalerType.STANDARD_TANH, ScalerType.ROBUST_TANH):
+            Xs = np.tanh(z)
+            # d/dx tanh((x-c)/s) = sech^2((x-c)/s) / s = (1 - tanh^2(z)) / s.
+            dXs_dx = (1.0 - Xs * Xs) / scale_safe
+            return Xs, dXs_dx
+
+        if mode in (
+            ScalerType.STANDARD_PERCENTILE_MINMAX,
+            ScalerType.ROBUST_PERCENTILE_MINMAX,
+        ):
+            z_lo, z_hi = self._require_percentile_bounds()
+            rng = np.maximum(z_hi - z_lo, self.eps)
+            u01 = (z - z_lo) / rng
+            Xs = 2.0 * u01 - 1.0
+            dXs_dx = np.broadcast_to(2.0 / (scale_safe * rng), X.shape).copy()
+            return Xs, dXs_dx
+
+        raise ValueError(f"Unhandled mode: {self.scaler!r}")
+
     def _scale_to_unit_interval(self, X: np.ndarray) -> np.ndarray:
         """Scale features into [-1, 1] according to the configured scaler mode."""
         mode = self._canonical_mode(self.scaler)

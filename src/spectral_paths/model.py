@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import time
 from itertools import combinations
-from typing import Dict, Iterator, List, Sequence, Tuple
+from typing import Dict, Iterator, List, Sequence, Tuple, TypedDict
 
 import numpy as np
 from sklearn.metrics import r2_score
@@ -23,6 +23,14 @@ from spectral_paths.utils.helpers import (
     train_test_split,
 )
 from spectral_paths.utils.preprocessing import AngularTransformer
+
+
+class EquationTerm(TypedDict):
+    """Typed representation of one ranked symbolic term."""
+
+    path: MVec
+    coef: float
+    energy: float
 
 
 class SpectralPathRegressor:
@@ -329,6 +337,106 @@ class SpectralPathRegressor:
         yhat = self.predict(X)
         return r2_score(y, yhat)
 
+    def _check_is_fitted(self) -> None:
+        """Ensure fitted model state required for prediction-style methods exists."""
+        if self.transformer_ is None or self.coef_ is None:
+            raise ValueError("Model is not fitted yet. Call fit(X, y) first.")
+        if self.n_features_in_ is None:
+            raise ValueError("Model is missing n_features_in_. Call fit(X, y) first.")
+        if self.p_mat_ is None or self.r_arr_ is None:
+            raise ValueError("Cached path structures are unavailable. Call fit(X, y) first.")
+
+    def input_gradients(self, X: Array) -> Array:
+        """
+        Compute analytic raw-input gradients of the fitted predictor.
+
+        For the fitted model
+
+            y_hat(theta) = c0 + sum_q A_q cos(m_q^T theta),
+
+        the chain rule gives, for each feature j,
+
+            d y_hat / d x_j
+            = - (d theta_j / d x_j) * sum_q [A_q * m_qj * sin(m_q^T theta)].
+
+        When the scaler is ``*_tanh``, the preprocessing is
+
+            z_j = tanh((x_j - c_j) / s_j),    theta_j = arccos(z_j),
+
+        so
+
+            d theta_j / d x_j = -sech((x_j - c_j) / s_j) / s_j,
+
+        and the expression simplifies to the form requested in the plotting
+        workflow. This implementation evaluates the analytic chain rule exactly
+        through the fitted transformer, without finite differences.
+        """
+        self._check_is_fitted()
+        X = np.asarray(X, dtype=float)
+        if X.ndim != 2:
+            raise ValueError(f"X must be 2D, got shape {X.shape}")
+        if X.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f"X has {X.shape[1]} features, expected {self.n_features_in_}"
+            )
+
+        assert self.transformer_ is not None
+        assert self.coef_ is not None
+        assert self.p_mat_ is not None
+        assert self.r_arr_ is not None
+
+        theta, dtheta_dx = self.transformer_.transform_with_jacobian(X)
+
+        # Each learned basis function is cos(r_q * <theta, p_q>) with m_q = r_q p_q.
+        phase = (theta @ self.p_mat_.T) * self.r_arr_[None, :]
+        sin_phase = np.sin(phase)
+        m_matrix = self.p_mat_ * self.r_arr_[:, None]
+        phase_sum = (sin_phase * self.coef_[1:][None, :]) @ m_matrix
+
+        return -dtheta_dx * phase_sum
+
+    def feature_importance_gradient(
+        self,
+        X: np.ndarray,
+        normalize: bool = True,
+        as_percentage: bool = True,
+        aggregate: str = "mean_abs",
+    ) -> np.ndarray:
+        """
+        Aggregate raw-input gradient magnitudes into feature importances.
+
+        Args:
+            X: Raw input matrix in the original feature units.
+            normalize: Whether to normalize the aggregated importances.
+            as_percentage: If ``True`` with normalization enabled, return values that
+                sum to 100.
+            aggregate: Aggregation rule. Supported values are ``"mean_abs"`` and
+                ``"rms"``.
+        """
+        if as_percentage and not normalize:
+            raise ValueError("as_percentage=True requires normalize=True.")
+
+        gradients = self.input_gradients(X)
+
+        if aggregate == "mean_abs":
+            importance = np.mean(np.abs(gradients), axis=0)
+        elif aggregate == "rms":
+            importance = np.sqrt(np.mean(np.square(gradients), axis=0))
+        else:
+            raise ValueError("aggregate must be either 'mean_abs' or 'rms'.")
+
+        if not normalize:
+            return importance
+
+        total = float(importance.sum())
+        if total <= 0.0:
+            return np.zeros_like(importance)
+
+        importance = importance / total
+        if as_percentage:
+            importance = 100.0 * importance
+        return importance
+
     def _compute_feature_importance_from_model(self) -> Array:
         """
         Compute feature importance from selected paths & coefficients.
@@ -356,6 +464,194 @@ class SpectralPathRegressor:
             importance = importance / importance.sum()
 
         return importance
+
+    def top_equation_terms(
+        self,
+        *,
+        n_terms: int = 12,
+        energy_power: float = 2.0,
+    ) -> List[EquationTerm]:
+        """
+        Return the top learned spectral terms ranked by coefficient magnitude.
+
+        Terms are ranked by ``abs(coef) ** energy_power`` and returned as dictionaries
+        containing the path, coefficient, and ranking energy.
+        """
+        if self.selected_paths_ is None or self.coef_ is None:
+            raise ValueError("Model must be fitted before extracting symbolic terms.")
+
+        ranked_terms: List[EquationTerm] = []
+        for idx, path in enumerate(self.selected_paths_):
+            coefficient = float(self.coef_[idx + 1])  # intercept is coef_[0]
+            ranked_terms.append(
+                {
+                    "path": path,
+                    "coef": coefficient,
+                    "energy": abs(coefficient) ** float(energy_power),
+                }
+            )
+
+        ranked_terms.sort(key=lambda term: float(term["energy"]), reverse=True)
+        return ranked_terms[: int(n_terms)]
+
+    def _format_equation_term(
+        self,
+        path: MVec,
+        coefficient: float,
+        feature_names: Sequence[str] | None,
+    ) -> str:
+        """Format one learned cosine term for terminal display."""
+        phase_parts: List[str] = []
+        for idx, path_value in enumerate(path):
+            if path_value == 0:
+                continue
+            if feature_names is None:
+                theta_name = f"theta{idx + 1}"
+            else:
+                theta_name = f"theta[{feature_names[idx]}]"
+
+            if path_value == 1:
+                phase_parts.append(theta_name)
+            else:
+                phase_parts.append(f"{path_value}*{theta_name}")
+
+        phase = " + ".join(phase_parts) if phase_parts else "0"
+        return f"{coefficient:+.6g} * cos({phase})"
+
+    def format_top_equation(
+        self,
+        *,
+        n_terms: int = 12,
+        feature_names: Sequence[str] | None = None,
+        include_intercept: bool = True,
+    ) -> str:
+        """
+        Format a truncated symbolic model string for terminal display.
+
+        The printed variables are angular coordinates, where
+        ``theta[j] = acos(transformed_feature[j])`` after the model's fitted scaler.
+        """
+        if self.coef_ is None:
+            raise ValueError("Model must be fitted before formatting an equation.")
+
+        pieces: List[str] = []
+        if include_intercept:
+            pieces.append(f"{float(self.coef_[0]):.6g}")
+
+        for term in self.top_equation_terms(n_terms=n_terms):
+            pieces.append(
+                self._format_equation_term(
+                    term["path"],
+                    float(term["coef"]),
+                    feature_names,
+                )
+            )
+
+        return "y_hat = " + " ".join(pieces)
+
+    def print_top_equation(
+        self,
+        *,
+        n_terms: int = 12,
+        feature_names: Sequence[str] | None = None,
+        include_intercept: bool = True,
+    ) -> str:
+        """Print a truncated symbolic model and return it as a string."""
+        equation = self.format_top_equation(
+            n_terms=n_terms,
+            feature_names=feature_names,
+            include_intercept=include_intercept,
+        )
+
+        print("\n=== Top terms (by |coef|^2) ===")
+        for rank, term in enumerate(self.top_equation_terms(n_terms=n_terms), start=1):
+            print(
+                f"{rank:02d}. energy={float(term['energy']):.6g} | "
+                f"coef={float(term['coef']):+.6g} | path={term['path']}"
+            )
+
+        print("\nNote: theta[j] = acos(transformed_feature[j]) after the fitted scaler.")
+        print("\n=== Symbolic truncated model ===")
+        print(equation)
+        return equation
+
+    def format_feature_transforms(
+        self,
+        *,
+        feature_names: Sequence[str] | None = None,
+    ) -> List[str]:
+        """
+        Format the fitted per-feature preprocessing transforms.
+
+        Each line describes ``theta_j = acos(s_j(x_j))`` where ``s_j`` is the fitted
+        scaler mapping into ``[-1, 1]`` prior to the angular transform.
+        """
+        if self.transformer_ is None or self.n_features_in_ is None:
+            raise ValueError("Model must be fitted before formatting feature transforms.")
+
+        transformer = self.transformer_
+        mode = transformer._canonical_mode(transformer.scaler)
+        lines: List[str] = []
+
+        for idx in range(self.n_features_in_):
+            name = feature_names[idx] if feature_names is not None else f"x{idx + 1}"
+
+            if mode is ScalerType.MINMAX:
+                if transformer.min_ is None or transformer.max_ is None:
+                    raise ValueError("Transformer min-max parameters are unavailable.")
+                min_arr = transformer.min_
+                max_arr = transformer.max_
+                min_ = float(min_arr[idx])
+                max_ = float(max_arr[idx])
+                lines.append(
+                    f"theta[{name}] = acos(2 * (({name} - {min_:.6g}) / "
+                    f"({max_:.6g} - {min_:.6g})) - 1)"
+                )
+                continue
+
+            if transformer.center_ is None or transformer.scale_ is None:
+                raise ValueError("Transformer z-score parameters are unavailable.")
+
+            center_arr = transformer.center_
+            scale_arr = transformer.scale_
+            center = float(center_arr[idx])
+            scale = float(scale_arr[idx])
+            z_term = f"(({name} - {center:.6g}) / {scale:.6g})"
+
+            if mode is ScalerType.STANDARD_TANH or mode is ScalerType.ROBUST_TANH:
+                lines.append(f"theta[{name}] = acos(tanh{z_term})")
+                continue
+
+            if transformer.z_lo_ is None or transformer.z_hi_ is None:
+                raise ValueError("Transformer percentile bounds are unavailable.")
+
+            z_lo_arr = transformer.z_lo_
+            z_hi_arr = transformer.z_hi_
+            z_lo = float(z_lo_arr[idx])
+            z_hi = float(z_hi_arr[idx])
+            lines.append(
+                ("theta[{name}] = acos(2 * (({z} - {z_lo:.6g}) / "
+                "({z_hi:.6g} - {z_lo:.6g})) - 1)").format(
+                    name=name,
+                    z=z_term,
+                    z_lo=z_lo,
+                    z_hi=z_hi,
+                )
+            )
+
+        return lines
+
+    def print_feature_transforms(
+        self,
+        *,
+        feature_names: Sequence[str] | None = None,
+    ) -> List[str]:
+        """Print the fitted per-feature preprocessing transforms."""
+        lines = self.format_feature_transforms(feature_names=feature_names)
+        print("\n=== Fitted Feature Transforms ===")
+        for line in lines:
+            print(line)
+        return lines
 
     def _balanced_compositions(self, L: int, r: int) -> List[List[int]]:
         comps = []
