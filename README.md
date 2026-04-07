@@ -33,8 +33,8 @@ y = X[:, 0] * 2.0 - X[:, 1] + rng.normal(scale=0.1, size=500)
 
 D = X.shape[1]
 model = SpectralPathRegressor(
-    max_paths=30 * D,
-    block_size=1 * D,
+    max_paths=256,
+    block_size=D,
     lambda_grid=np.logspace(-5, -1, 25),
     scaler_type="robust_tanh",
     bound_percentiles=(5, 95),
