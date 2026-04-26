@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import List, Tuple
+from typing import List, Tuple, TypedDict
 
 from spectral_paths.types import Array
 
@@ -78,3 +78,10 @@ class Stats:
     accumulation_time_sec: float = 0.0
     scoring_time_sec: float = 0.0
     lambda_sweep_time_sec: float = 0.0
+
+
+class DatasetSpec(TypedDict):
+    """DatasetSpec schema."""
+    name: str
+    openml_name: str
+    version: int
