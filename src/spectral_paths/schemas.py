@@ -41,6 +41,16 @@ class BlasThreadInfo:
 
 
 @dataclass
+class RegularizationInfo:
+    """Resolved regularization settings for one model fit."""
+
+    mode: str = "uniform"
+    path_complexity: str | None = None
+    penalty_schedule: str | None = None
+    penalty_strength: float | None = None
+
+
+@dataclass
 class FitReport:
     """
     Summary of a spectral path model fit.
@@ -68,6 +78,7 @@ class FitReport:
     feature_importance: Array | None = None
     phase_timings: PhaseTimings = field(default_factory=PhaseTimings)
     blas_threads: BlasThreadInfo = field(default_factory=BlasThreadInfo)
+    regularization: RegularizationInfo = field(default_factory=RegularizationInfo)
 
 @dataclass
 class Stats:

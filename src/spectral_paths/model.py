@@ -16,13 +16,21 @@ import numpy as np
 from sklearn.metrics import r2_score
 from threadpoolctl import threadpool_limits
 
-from spectral_paths.schemas import BlasThreadInfo, FitReport, PhaseTimings, ScalerType, Stats
+from spectral_paths.schemas import (
+    BlasThreadInfo,
+    FitReport,
+    PhaseTimings,
+    RegularizationInfo,
+    ScalerType,
+    Stats,
+)
 from spectral_paths.types import Array, MVec
 from spectral_paths.utils.helpers import (
     _build_feature_matrix,
     _compute_initial_importance,
     _metrics,
     _path_matrix_and_r_arr,
+    _primitive_and_order,
     check_dimensions,
     train_test_split,
 )
@@ -88,6 +96,10 @@ class SpectralPathRegressor:
         adaptive_block_size: bool = True,
         min_block_size: int = 1,
         use_importance_ordering: bool = True,
+        regularization_mode: Literal["uniform", "complexity_weighted"] = "uniform",
+        path_complexity: Literal["total_order", "sparsity", "harmonic_order"] = "total_order",
+        complexity_penalty_schedule: Literal["linear", "exponential"] = "exponential",
+        complexity_penalty_strength: float = 1.0,
     ) -> None:
         """
         Initialise a spectral path regression model.
@@ -146,6 +158,15 @@ class SpectralPathRegressor:
                 enabled.
             use_importance_ordering (bool): Whether to prioritise candidate paths using
                 univariate importanceheuristics.
+            regularization_mode (Literal["uniform", "complexity_weighted"]): Select
+                between the baseline uniform ridge penalty and a complexity-weighted
+                ridge penalty.
+            path_complexity (Literal["total_order", "sparsity", "harmonic_order"]):
+                Path-complexity definition used when the weighted penalty is enabled.
+            complexity_penalty_schedule (Literal["linear", "exponential"]): Schedule
+                used to convert normalized path complexity into ridge weights.
+            complexity_penalty_strength (float): Positive penalty slope/sharpness used
+                by the selected schedule.
         """
         if max_paths <= 0:
             raise ValueError("max_paths must be a non-negative integer")
@@ -221,7 +242,30 @@ class SpectralPathRegressor:
         self.adaptive_block_size = bool(adaptive_block_size)
         self.min_block_size = int(min_block_size)
         self.use_importance_ordering = bool(use_importance_ordering)
+        self.regularization_mode = str(regularization_mode)
+        self.path_complexity = str(path_complexity)
+        self.complexity_penalty_schedule = str(complexity_penalty_schedule)
+        self.complexity_penalty_strength = float(complexity_penalty_strength)
         self.n_features_in_: int | None = None
+
+        if self.regularization_mode not in {"uniform", "complexity_weighted"}:
+            raise ValueError(
+                "regularization_mode must be either 'uniform' or 'complexity_weighted'."
+            )
+        if self.path_complexity not in {"total_order", "sparsity", "harmonic_order"}:
+            raise ValueError(
+                "path_complexity must be one of 'total_order', 'sparsity', or "
+                "'harmonic_order'."
+            )
+        if self.complexity_penalty_schedule not in {"linear", "exponential"}:
+            raise ValueError(
+                "complexity_penalty_schedule must be either 'linear' or 'exponential'."
+            )
+        if (
+            not np.isfinite(self.complexity_penalty_strength)
+            or self.complexity_penalty_strength <= 0.0
+        ):
+            raise ValueError("complexity_penalty_strength must be finite and > 0.")
 
         self.selected_paths_: List[MVec] | None = None
         self.lambda_: float | None = None
@@ -297,7 +341,7 @@ class SpectralPathRegressor:
         t2 = time.perf_counter()
         gram_matrix, target_col = self._compute_normal_eqn(θ, y, paths)
         t3 = time.perf_counter()
-        coefficients = self._solve_normal_eqn(gram_matrix, target_col, lambda_star)
+        coefficients = self._solve_normal_eqn(gram_matrix, target_col, lambda_star, paths)
         t4 = time.perf_counter()
         return t3 - t2, t4 - t3, coefficients
 
@@ -396,6 +440,24 @@ class SpectralPathRegressor:
             blas_threads=BlasThreadInfo(
                 policy=self.blas_thread_policy,
                 resolved_threads=resolved_blas_threads,
+            ),
+            regularization=RegularizationInfo(
+                mode=self.regularization_mode,
+                path_complexity=(
+                    self.path_complexity
+                    if self.regularization_mode == "complexity_weighted"
+                    else None
+                ),
+                penalty_schedule=(
+                    self.complexity_penalty_schedule
+                    if self.regularization_mode == "complexity_weighted"
+                    else None
+                ),
+                penalty_strength=(
+                    self.complexity_penalty_strength
+                    if self.regularization_mode == "complexity_weighted"
+                    else None
+                ),
             ),
         )
 
@@ -785,7 +847,60 @@ class SpectralPathRegressor:
             s[0] = 1.0
         return s
 
-    def _solve_normal_eqn(self, G: Array, b: Array, lambda_: float) -> Array:
+    def _path_complexity_value(self, path: MVec) -> float:
+        """Return a scalar complexity value for one spectral path."""
+        if self.path_complexity == "total_order":
+            return float(sum(abs(path_value) for path_value in path))
+        if self.path_complexity == "sparsity":
+            return float(sum(1 for path_value in path if path_value != 0))
+        if self.path_complexity == "harmonic_order":
+            _, order = _primitive_and_order(path)
+            return float(order)
+        raise ValueError(f"Unsupported path_complexity {self.path_complexity!r}.")
+
+    def _normalized_path_complexities(self, paths: Sequence[MVec]) -> Array:
+        """Normalize path-complexity values into a stable [0, 1] interval."""
+        if len(paths) == 0:
+            return np.zeros(0, dtype=float)
+
+        raw_complexities = np.asarray(
+            [self._path_complexity_value(path) for path in paths],
+            dtype=float,
+        )
+        raw_min = float(raw_complexities.min())
+        raw_max = float(raw_complexities.max())
+        if raw_max <= raw_min:
+            return np.zeros_like(raw_complexities)
+        return (raw_complexities - raw_min) / (raw_max - raw_min)
+
+    def _feature_regularization_weights(self, paths: Sequence[MVec]) -> Array:
+        """Return per-path ridge weights for feature terms only."""
+        if self.regularization_mode == "uniform":
+            return np.ones(len(paths), dtype=float)
+
+        normalized = self._normalized_path_complexities(paths)
+        if self.complexity_penalty_schedule == "linear":
+            return 1.0 + self.complexity_penalty_strength * normalized
+        if self.complexity_penalty_schedule == "exponential":
+            return np.exp(self.complexity_penalty_strength * normalized)
+        raise ValueError(
+            f"Unsupported complexity_penalty_schedule "
+            f"{self.complexity_penalty_schedule!r}."
+        )
+
+    def _regularization_weights(self, paths: Sequence[MVec]) -> Array:
+        """Return full ridge weights including the intercept slot."""
+        feature_weights = self._feature_regularization_weights(paths)
+        intercept_weight = 1.0 if self.regularization_mode == "uniform" else 0.0
+        return np.concatenate(([intercept_weight], feature_weights))
+
+    def _solve_weighted_linear_system(self, A: Array, b: Array) -> Array:
+        """Solve the weighted ridge linear system."""
+        return np.asarray(np.linalg.solve(A, b), dtype=self._internal_dtype)
+
+    def _solve_normal_eqn(
+        self, G: Array, b: Array, lambda_: float, paths: Sequence[MVec]
+    ) -> Array:
         """
         Solve ridge from Gram, optionally with implicit column normalization.
 
@@ -794,21 +909,30 @@ class SpectralPathRegressor:
             Solve (G_tilde + lam I) w_tilde = b_tilde
             Return w = (1/s) * w_tilde (so predictions use original Φ).
         """
+        ridge_weights = np.asarray(self._regularization_weights(paths), dtype=G.dtype)
         if self.normalize_columns:
             scaling_vector = self._calc_scaling_vector(G)
             inv_s = 1.0 / scaling_vector
             G = (inv_s[:, None] * G) * inv_s[None, :]
             b = inv_s * b
 
-            evals, U = np.linalg.eigh(G)
-            coeffs = self._ridge_solve_for_coeffs(evals, U, b, lambda_)
+            if self.regularization_mode == "uniform":
+                evals, U = np.linalg.eigh(G)
+                coeffs = self._ridge_solve_for_coeffs(evals, U, b, lambda_)
+            else:
+                G = G + np.diag(lambda_ * ridge_weights)
+                coeffs = self._solve_weighted_linear_system(G, b)
             coeffs = inv_s * coeffs
 
             return coeffs
 
-        evals, U = np.linalg.eigh(G)
-        coeffs = self._ridge_solve_for_coeffs(evals, U, b, lambda_)
-        return coeffs
+        if self.regularization_mode == "uniform":
+            evals, U = np.linalg.eigh(G)
+            coeffs = self._ridge_solve_for_coeffs(evals, U, b, lambda_)
+            return coeffs
+
+        G = G + np.diag(lambda_ * ridge_weights)
+        return self._solve_weighted_linear_system(G, b)
 
     def _ridge_solve_for_coeffs(
         self, evals: Array, U: Array, b: Array, lam: float
@@ -1004,7 +1128,7 @@ class SpectralPathRegressor:
         p_mat = self._as_internal_dtype(p_mat)
 
         # Cache eigendecomp for lambda sweep
-        if self.normalize_columns:
+        if self.regularization_mode == "uniform" and self.normalize_columns:
             s = self._calc_scaling_vector(G_tr)
             inv_s = 1.0 / s
             Gs = (inv_s[:, None] * G_tr) * inv_s[None, :]
@@ -1015,11 +1139,16 @@ class SpectralPathRegressor:
                 w_tilde = self._ridge_solve_for_coeffs(evals, U, bs, lam_val)
                 return inv_s * w_tilde
 
-        else:
+        elif self.regularization_mode == "uniform":
             evals, U = np.linalg.eigh(G_tr)
 
             def solve_for_coeffs(lam_val: float) -> Array:
                 return self._ridge_solve_for_coeffs(evals, U, b_tr, lam_val)
+
+        else:
+
+            def solve_for_coeffs(lam_val: float) -> Array:
+                return self._solve_normal_eqn(G_tr, b_tr, lam_val, paths)
 
         best_lam, _, _ = self._score_lambda_candidates(
             solve_for_coeffs=solve_for_coeffs,
@@ -1200,7 +1329,7 @@ class SpectralPathRegressor:
 
         lambda_sweep_time = 0.0
         if lambda_star is None:
-            if self.normalize_columns:
+            if self.regularization_mode == "uniform" and self.normalize_columns:
                 scaling_vector = self._calc_scaling_vector(G_trial)
                 inv_s_trial = 1.0 / scaling_vector
                 Gs_trial = (inv_s_trial[:, None] * G_trial) * inv_s_trial[None, :]
@@ -1213,13 +1342,18 @@ class SpectralPathRegressor:
                     )
                     return scaled_coeffs * inv_s_trial
 
-            else:
+            elif self.regularization_mode == "uniform":
                 evals_trial, U_trial = np.linalg.eigh(G_trial)
 
                 def solve_for_coeffs(lambda_: float) -> Array:
                     return self._ridge_solve_for_coeffs(
                         evals_trial, U_trial, b_trial, lambda_
                     )
+
+            else:
+
+                def solve_for_coeffs(lambda_: float) -> Array:
+                    return self._solve_normal_eqn(G_trial, b_trial, lambda_, trial_paths)
 
             cand_lambda, cand_r2_score, lambda_sweep_time = self._score_lambda_candidates(
                 solve_for_coeffs=solve_for_coeffs,
@@ -1229,7 +1363,7 @@ class SpectralPathRegressor:
                 y_val=y_val,
             )
         else:
-            coeffs = self._solve_normal_eqn(G_trial, b_trial, lambda_star)
+            coeffs = self._solve_normal_eqn(G_trial, b_trial, lambda_star, trial_paths)
             y_val_hat = self._stream_predict(θ_val, coeffs, p_mat_trial, r_arr_trial)
             _, cand_r2_score = _metrics(y_val, y_val_hat)
             cand_lambda = lambda_star

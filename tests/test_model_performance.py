@@ -6,6 +6,7 @@ from typing import Literal
 
 import numpy as np
 
+from examples.benchmark_cpu import benchmark_cases, make_model
 from spectral_paths.model import SpectralPathRegressor
 
 
@@ -43,6 +44,10 @@ def _make_model(
     greedy_subsample: float | int | None = None,
     adaptive_block_size: bool = True,
     use_importance_ordering: bool = True,
+    regularization_mode: Literal["uniform", "complexity_weighted"] = "uniform",
+    path_complexity: Literal["total_order", "sparsity", "harmonic_order"] = "total_order",
+    complexity_penalty_schedule: Literal["linear", "exponential"] = "exponential",
+    complexity_penalty_strength: float = 1.0,
 ) -> SpectralPathRegressor:
     return SpectralPathRegressor(
         max_paths=max_paths,
@@ -63,6 +68,10 @@ def _make_model(
         greedy_subsample=greedy_subsample,
         adaptive_block_size=adaptive_block_size,
         use_importance_ordering=use_importance_ordering,
+        regularization_mode=regularization_mode,
+        path_complexity=path_complexity,
+        complexity_penalty_schedule=complexity_penalty_schedule,
+        complexity_penalty_strength=complexity_penalty_strength,
     )
 
 
@@ -192,3 +201,99 @@ def test_none_and_single_blas_policies_match_predictions() -> None:
         rtol=1e-8,
         atol=1e-8,
     )
+
+
+def test_uniform_regularization_mode_preserves_predictions() -> None:
+    """Explicit uniform mode should match the default baseline implementation."""
+    X, y = _make_regression_data(seed=11, n_samples=140, n_features=6)
+    default_model = _make_model()
+    explicit_uniform = _make_model(regularization_mode="uniform")
+
+    default_model.fit(X, y)
+    explicit_uniform.fit(X, y)
+
+    np.testing.assert_allclose(
+        default_model.predict(X),
+        explicit_uniform.predict(X),
+        rtol=1e-8,
+        atol=1e-8,
+    )
+
+
+def test_path_complexity_definitions_match_expected_values() -> None:
+    """Complexity helpers should match the intended path definitions."""
+    path = (2, 0, 2, 0)
+
+    model_total = _make_model(path_complexity="total_order")
+    model_sparsity = _make_model(path_complexity="sparsity")
+    model_harmonic = _make_model(path_complexity="harmonic_order")
+
+    assert model_total._path_complexity_value(path) == 4.0
+    assert model_sparsity._path_complexity_value(path) == 2.0
+    assert model_harmonic._path_complexity_value(path) == 2.0
+
+
+def test_complexity_penalty_schedules_are_monotone() -> None:
+    """Linear and exponential schedules should increase with complexity."""
+    paths = [(1, 0, 0), (1, 1, 0), (2, 2, 0)]
+
+    linear_model = _make_model(
+        regularization_mode="complexity_weighted",
+        path_complexity="total_order",
+        complexity_penalty_schedule="linear",
+        complexity_penalty_strength=2.0,
+    )
+    exp_model = _make_model(
+        regularization_mode="complexity_weighted",
+        path_complexity="total_order",
+        complexity_penalty_schedule="exponential",
+        complexity_penalty_strength=1.5,
+    )
+
+    linear_weights = linear_model._feature_regularization_weights(paths)
+    exp_weights = exp_model._feature_regularization_weights(paths)
+
+    assert np.all(linear_weights >= 1.0)
+    assert np.all(exp_weights >= 1.0)
+    assert np.all(np.diff(linear_weights) >= 0.0)
+    assert np.all(np.diff(exp_weights) >= 0.0)
+
+
+def test_weighted_regularization_runs_and_leaves_intercept_unpenalized() -> None:
+    """Weighted ridge should fit successfully and not penalize the intercept slot."""
+    X, y = _make_regression_data(seed=13, n_samples=150, n_features=6)
+    model = _make_model(
+        regularization_mode="complexity_weighted",
+        path_complexity="harmonic_order",
+        complexity_penalty_schedule="exponential",
+        complexity_penalty_strength=1.25,
+    )
+
+    model.fit(X, y)
+
+    assert model.coef_ is not None
+    assert np.all(np.isfinite(model.coef_))
+    assert np.all(np.isfinite(model.predict(X)))
+    np.testing.assert_allclose(model._regularization_weights([(1, 0), (2, 0)])[0], 0.0)
+
+
+def test_benchmark_case_matrix_starts_with_baseline_and_covers_variants() -> None:
+    """Benchmark cases should include the baseline first and all weighted variants."""
+    cases = benchmark_cases()
+
+    assert cases[0].regularization_mode == "uniform"
+    assert cases[0].name == "baseline-uniform"
+    assert len(cases) == 7
+
+
+def test_benchmark_model_receives_regularization_config() -> None:
+    """Benchmark model factory should pass complexity-aware settings through."""
+    X, _ = _make_regression_data(seed=17, n_samples=100, n_features=4)
+    weighted_case = benchmark_cases()[1]
+
+    model = make_model("openml", X, mode="fast", case=weighted_case)
+
+    assert model.regularization_mode == "complexity_weighted"
+    assert model.path_complexity == weighted_case.path_complexity
+    assert model.complexity_penalty_schedule == weighted_case.complexity_penalty_schedule
+    assert model.complexity_penalty_strength == weighted_case.complexity_penalty_strength
