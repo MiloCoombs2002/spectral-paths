@@ -1,8 +1,4 @@
-"""
-Spectral path regression model.
-
-This module implements the `SpectralPathRegressor` model.
-"""
+"""Spectral path regression and classification models."""
 from __future__ import annotations
 
 import os
@@ -19,10 +15,14 @@ from threadpoolctl import threadpool_limits
 from spectral_paths.schemas import BlasThreadInfo, FitReport, PhaseTimings, ScalerType, Stats
 from spectral_paths.types import Array, MVec
 from spectral_paths.utils.helpers import (
+    _binary_accuracy,
+    _binary_log_loss,
     _build_feature_matrix,
+    _clip_probabilities,
     _compute_initial_importance,
     _metrics,
     _path_matrix_and_r_arr,
+    _sigmoid,
     check_dimensions,
     train_test_split,
 )
@@ -46,6 +46,15 @@ class CandidateEvaluation(TypedDict):
     b_trial: Array
     cand_lambda: float
     cand_r2_score: float
+
+
+class ClassifierCandidateEvaluation(TypedDict):
+    """Typed representation of one greedy classifier candidate-block evaluation."""
+
+    k: int
+    paths: List[MVec]
+    cand_lambda: float
+    cand_log_loss: float
 
 
 class SpectralPathRegressor:
@@ -1331,3 +1340,452 @@ class SpectralPathRegressor:
             Gnew_map[k] = np.zeros((Qnew, Qnew), dtype=self._internal_dtype)
             bnew_map[k] = np.zeros(Qnew, dtype=self._internal_dtype)
         return cand_struct, C_map, Gnew_map, bnew_map
+
+
+class SpectralPathClassifier(SpectralPathRegressor):
+    """
+    Binary spectral-path classifier trained with penalized logistic IRLS.
+
+    This estimator reuses the spectral path dictionary construction from
+    ``SpectralPathRegressor`` but fits logistic coefficients for
+
+        f(x) = w0 + sum_q w_q phi_q(x),
+        P(y=1 | x) = sigmoid(f(x)).
+    """
+
+    def __init__(
+        self,
+        *,
+        max_paths: int,
+        block_size: int,
+        lambda_grid: Sequence[float] = (0.01, 0.1, 1.0),
+        l_max: int | None = None,
+        batch_rows: int = 2048,
+        k_values: Sequence[int] = (1, 2, 3),
+        val_size: float = 0.25,
+        random_state: int = 42,
+        verbose: bool = True,
+        final_lambda_refit: bool = True,
+        normalize_columns: bool = True,
+        normalize_intercept: bool = False,
+        eps_col_norm: float = 1e-12,
+        use_float32: bool = False,
+        lambda_parallel_workers: int = 1,
+        blas_thread_policy: Literal["auto", "none", "single", "manual"] = "auto",
+        blas_threads: int | None = None,
+        early_stopping_patience: int = 3,
+        early_stopping_tol: float = 1e-4,
+        greedy_subsample: float | int | None = None,
+        scaler_type: ScalerType | str = ScalerType.STANDARD_PERCENTILE_MINMAX,
+        iqr_percentile_range: Tuple[float, float] = (25.0, 75.0),
+        bound_percentiles: Tuple[float, float] = (2.0, 98.0),
+        adaptive_block_size: bool = True,
+        min_block_size: int = 1,
+        use_importance_ordering: bool = True,
+        irls_max_iter: int = 100,
+        irls_tol: float = 1e-6,
+        irls_eps: float = 1e-8,
+    ) -> None:
+        """Initialise a binary spectral-path classifier."""
+        super().__init__(
+            max_paths=max_paths,
+            block_size=block_size,
+            lambda_grid=lambda_grid,
+            l_max=l_max,
+            batch_rows=batch_rows,
+            k_values=k_values,
+            val_size=val_size,
+            random_state=random_state,
+            verbose=verbose,
+            final_lambda_refit=final_lambda_refit,
+            normalize_columns=normalize_columns,
+            normalize_intercept=normalize_intercept,
+            eps_col_norm=eps_col_norm,
+            use_float32=use_float32,
+            lambda_parallel_workers=lambda_parallel_workers,
+            blas_thread_policy=blas_thread_policy,
+            blas_threads=blas_threads,
+            early_stopping_patience=early_stopping_patience,
+            early_stopping_tol=early_stopping_tol,
+            greedy_subsample=greedy_subsample,
+            scaler_type=scaler_type,
+            iqr_percentile_range=iqr_percentile_range,
+            bound_percentiles=bound_percentiles,
+            adaptive_block_size=adaptive_block_size,
+            min_block_size=min_block_size,
+            use_importance_ordering=use_importance_ordering,
+        )
+        if irls_max_iter < 1:
+            raise ValueError("irls_max_iter must be >= 1.")
+        if irls_tol <= 0.0:
+            raise ValueError("irls_tol must be > 0.")
+        if not (0.0 < irls_eps < 0.5):
+            raise ValueError("irls_eps must lie in (0, 0.5).")
+        self.irls_max_iter = int(irls_max_iter)
+        self.irls_tol = float(irls_tol)
+        self.irls_eps = float(irls_eps)
+        self.classes_ = np.array([0, 1], dtype=int)
+
+    def _validate_binary_targets(self, y: Array) -> Array:
+        """Ensure the classifier receives exactly 0/1 targets."""
+        y = np.asarray(y, dtype=float).ravel()
+        uniques = np.unique(y)
+        if uniques.size == 0:
+            raise ValueError("y must not be empty.")
+        if not np.array_equal(uniques, np.array([0.0, 1.0])) and not np.array_equal(
+            uniques, np.array([0.0])
+        ) and not np.array_equal(uniques, np.array([1.0])):
+            raise ValueError("SpectralPathClassifier requires binary labels encoded as 0/1.")
+        return y
+
+    def _build_design_matrix(self, theta: Array, paths: Sequence[MVec]) -> Array:
+        """Build the spectral feature matrix for a fixed path set."""
+        if len(paths) == 0:
+            return np.ones((theta.shape[0], 1), dtype=self._internal_dtype)
+        p_mat, r_arr = _path_matrix_and_r_arr(paths)
+        p_mat = self._as_internal_dtype(p_mat)
+        return _build_feature_matrix(theta, p_mat, r_arr)
+
+    def _initial_logit(self, y: Array) -> float:
+        """Return the intercept-only logit for the empirical positive rate."""
+        mean_y = float(np.clip(np.mean(y), self.irls_eps, 1.0 - self.irls_eps))
+        return float(np.log(mean_y / (1.0 - mean_y)))
+
+    def _fit_logistic_irls(
+        self,
+        phi: Array,
+        y: Array,
+        lambda_: float,
+        initial_coeffs: Array | None = None,
+    ) -> Array:
+        """Fit penalized logistic coefficients with IRLS on a fixed design matrix."""
+        phi = np.asarray(phi, dtype=float)
+        y = np.asarray(y, dtype=float).ravel()
+        if phi.ndim != 2:
+            raise ValueError("phi must be 2D.")
+        if phi.shape[0] != y.shape[0]:
+            raise ValueError("phi rows must match y.")
+
+        if self.normalize_columns:
+            scaling_vector = self._calc_scaling_vector(phi.T @ phi)
+            inv_s = 1.0 / scaling_vector
+            phi_scaled = phi * inv_s[None, :]
+        else:
+            scaling_vector = np.ones(phi.shape[1], dtype=float)
+            inv_s = scaling_vector
+            phi_scaled = phi
+
+        penalty = np.ones(phi_scaled.shape[1], dtype=float)
+        penalty[0] = 0.0
+
+        if initial_coeffs is None or np.asarray(initial_coeffs).shape[0] != phi_scaled.shape[1]:
+            coeffs = np.zeros(phi_scaled.shape[1], dtype=float)
+            coeffs[0] = self._initial_logit(y)
+        else:
+            coeffs = np.asarray(initial_coeffs, dtype=float) / scaling_vector
+
+        ridge = float(lambda_) * penalty
+
+        for _ in range(self.irls_max_iter):
+            logits = phi_scaled @ coeffs
+            probs = _clip_probabilities(_sigmoid(logits), eps=self.irls_eps)
+            weights = np.maximum(probs * (1.0 - probs), self.irls_eps)
+            work_response = logits + (y - probs) / weights
+
+            weighted_phi = phi_scaled * weights[:, None]
+            hessian = phi_scaled.T @ weighted_phi
+            hessian += np.diag(ridge)
+            rhs = phi_scaled.T @ (weights * work_response)
+
+            try:
+                new_coeffs = np.linalg.solve(hessian, rhs)
+            except np.linalg.LinAlgError:
+                new_coeffs = np.linalg.lstsq(hessian, rhs, rcond=None)[0]
+
+            delta = np.linalg.norm(new_coeffs - coeffs)
+            coeffs = new_coeffs
+            if delta <= self.irls_tol * (1.0 + np.linalg.norm(coeffs)):
+                break
+
+        return coeffs / scaling_vector
+
+    def _score_lambda_candidates_classifier(
+        self,
+        phi_tr: Array,
+        y_tr: Array,
+        phi_val: Array,
+        y_val: Array,
+        initial_coeffs: Array | None = None,
+    ) -> tuple[float, float, Array, float]:
+        """Evaluate all lambdas and return the best validation log loss."""
+
+        def evaluate_one(lam: float) -> tuple[float, float, Array]:
+            coeffs = self._fit_logistic_irls(phi_tr, y_tr, lam, initial_coeffs=initial_coeffs)
+            val_probs = _sigmoid(phi_val @ coeffs)
+            val_loss = _binary_log_loss(y_val, val_probs, eps=self.irls_eps)
+            return float(lam), float(val_loss), coeffs
+
+        t0 = time.perf_counter()
+        if self._outer_parallelism_enabled():
+            max_workers = min(self.lambda_parallel_workers, len(self.lambda_grid))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                results = list(executor.map(evaluate_one, self.lambda_grid))
+        else:
+            results = [evaluate_one(lam) for lam in self.lambda_grid]
+
+        best_lam, best_loss, best_coeffs = min(results, key=lambda item: (item[1], item[0]))
+        return best_lam, best_loss, best_coeffs, time.perf_counter() - t0
+
+    def _evaluate_candidate_block_classifier(
+        self,
+        *,
+        k: int,
+        paths: List[MVec],
+        selected_paths: List[MVec],
+        theta_tr: Array,
+        y_tr: Array,
+        theta_val: Array,
+        y_val: Array,
+        lambda_star: float | None,
+        initial_coeffs: Array | None,
+    ) -> tuple[ClassifierCandidateEvaluation, float]:
+        """Evaluate one classifier candidate block and return validation log loss."""
+        trial_paths = selected_paths + paths
+        phi_tr = self._build_design_matrix(theta_tr, trial_paths)
+        phi_val = self._build_design_matrix(theta_val, trial_paths)
+
+        lambda_sweep_time = 0.0
+        if lambda_star is None:
+            cand_lambda, cand_log_loss, _, lambda_sweep_time = (
+                self._score_lambda_candidates_classifier(
+                    phi_tr, y_tr, phi_val, y_val, initial_coeffs=initial_coeffs
+                )
+            )
+        else:
+            coeffs = self._fit_logistic_irls(phi_tr, y_tr, lambda_star, initial_coeffs=initial_coeffs)
+            cand_log_loss = _binary_log_loss(y_val, _sigmoid(phi_val @ coeffs), eps=self.irls_eps)
+            cand_lambda = float(lambda_star)
+
+        return (
+            ClassifierCandidateEvaluation(
+                k=k,
+                paths=paths,
+                cand_lambda=float(cand_lambda),
+                cand_log_loss=float(cand_log_loss),
+            ),
+            lambda_sweep_time,
+        )
+
+    def _select_paths_and_lambda_classifier(
+        self, theta_tr: Array, y_tr: Array, theta_val: Array, y_val: Array
+    ) -> Tuple[List[MVec], float, Stats]:
+        """Greedily select k-sparse paths using validation log loss."""
+        t0 = time.perf_counter()
+        generators = {k: self._path_generator(k) for k in self.k_values}
+        selected_paths: List[MVec] = []
+        history: List[Tuple[int, int, float, float]] = []
+        lambda_star: float | None = None
+        best_log_loss_overall = float("inf")
+        no_improve_count = 0
+        stopped_early = False
+        current_block_size = self.block_size
+        scoring_time = 0.0
+        lambda_sweep_time = 0.0
+
+        while len(selected_paths) < self.max_paths:
+            remaining_number_of_paths = self.max_paths - len(selected_paths)
+            block_size = min(current_block_size, remaining_number_of_paths)
+            candidates = self._generate_candidates(generators, block_size)
+
+            if not candidates:
+                self._log("All generators exhausted before reaching max_paths.")
+                break
+
+            best_log_loss = float("inf")
+            best_choice: ClassifierCandidateEvaluation | None = None
+
+            t_score_start = time.perf_counter()
+            phi_current = self._build_design_matrix(theta_tr, selected_paths)
+            initial_coeffs = None
+            if self.coef_ is not None and len(selected_paths) == len(self.selected_paths_ or []):
+                initial_coeffs = self.coef_
+            elif phi_current.shape[1] > 0:
+                initial_coeffs = self._fit_logistic_irls(
+                    phi_current,
+                    y_tr,
+                    lambda_star if lambda_star is not None else self.lambda_grid[0],
+                )
+
+            for k, paths in candidates.items():
+                candidate_eval, candidate_lambda_sweep = self._evaluate_candidate_block_classifier(
+                    k=k,
+                    paths=paths,
+                    selected_paths=selected_paths,
+                    theta_tr=theta_tr,
+                    y_tr=y_tr,
+                    theta_val=theta_val,
+                    y_val=y_val,
+                    lambda_star=lambda_star,
+                    initial_coeffs=initial_coeffs,
+                )
+                lambda_sweep_time += candidate_lambda_sweep
+
+                if candidate_eval["cand_log_loss"] < best_log_loss:
+                    best_log_loss = candidate_eval["cand_log_loss"]
+                    best_choice = candidate_eval
+            scoring_time += time.perf_counter() - t_score_start
+
+            assert best_choice is not None
+            k_win = best_choice["k"]
+            block_win = best_choice["paths"]
+            lam_win = best_choice["cand_lambda"]
+            selected_paths.extend(block_win)
+            if lambda_star is None:
+                lambda_star = lam_win
+            history.append((k_win, len(block_win), lambda_star, best_log_loss))
+
+            improving = best_log_loss < best_log_loss_overall - self.early_stopping_tol
+            if improving:
+                best_log_loss_overall = best_log_loss
+                no_improve_count = 0
+                if self.adaptive_block_size and current_block_size < self.block_size:
+                    current_block_size = min(self.block_size, current_block_size + 1)
+            else:
+                no_improve_count += 1
+                if current_block_size > self.min_block_size and self.adaptive_block_size:
+                    current_block_size = max(self.min_block_size, current_block_size - 1)
+                if no_improve_count >= self.early_stopping_patience:
+                    self._log(
+                        f"[Early stopping] No improvement for {self.early_stopping_patience} "
+                        f"rounds at {len(selected_paths)} paths"
+                    )
+                    stopped_early = True
+                    break
+
+            self._log(
+                f"[Greedy] Added k={k_win} block of {len(block_win)} → total="
+                f"{len(selected_paths)} | λ_used={lambda_star} | log_loss_val="
+                f"{best_log_loss:0.6f} | block_size={current_block_size}"
+            )
+
+        if lambda_star is None:
+            lambda_star = self.lambda_grid[0]
+
+        if self.final_lambda_refit and len(self.lambda_grid) > 0:
+            t_lambda_refit_start = time.perf_counter()
+            phi_tr = self._build_design_matrix(theta_tr, selected_paths)
+            phi_val = self._build_design_matrix(theta_val, selected_paths)
+            lambda_star, _, _, extra_sweep = self._score_lambda_candidates_classifier(
+                phi_tr, y_tr, phi_val, y_val
+            )
+            lambda_sweep_time += extra_sweep + (time.perf_counter() - t_lambda_refit_start) - extra_sweep
+
+        stats = Stats(
+            stopped_early=stopped_early,
+            history=history,
+            time_taken=time.perf_counter() - t0,
+            accumulation_time_sec=0.0,
+            scoring_time_sec=scoring_time,
+            lambda_sweep_time_sec=lambda_sweep_time,
+        )
+        return selected_paths, lambda_star, stats
+
+    def fit(
+        self, X: Array, y: Array, *, X_val: Array | None = None, y_val: Array | None = None
+    ) -> "SpectralPathClassifier":
+        """Fit the binary classifier."""
+        t_fit_start = time.perf_counter()
+        X = np.asarray(X)
+        y = self._validate_binary_targets(y)
+        check_dimensions(X, y)
+
+        self.n_features_in_ = int(X.shape[1])
+        k_max = max(self.k_values)
+        if k_max > self.n_features_in_:
+            raise ValueError(f"Invalid k_values: max(k_values)={k_max} exceeds n_features.")
+
+        X_tr, y_tr, X_val, y_val = self._prepare_train_val_split(X, y, X_val, y_val)
+        y_tr = self._validate_binary_targets(y_tr)
+        y_val = self._validate_binary_targets(y_val)
+
+        t_pre_start = time.perf_counter()
+        theta_tr, theta_val = self._transform_data(X_tr, X_val)
+        theta_tr = self._as_internal_dtype(theta_tr)
+        theta_val = self._as_internal_dtype(theta_val)
+        y_tr = self._as_internal_dtype(y_tr)
+        y_val = self._as_internal_dtype(y_val)
+        preprocessing_time = time.perf_counter() - t_pre_start
+
+        self._compute_feature_importance(theta_tr, y_tr)
+        theta_tr_greedy, y_tr_greedy = self._subsample_greedy_training_data(theta_tr, y_tr)
+        resolved_blas_threads = self._resolve_blas_threads(theta_tr_greedy.shape[0])
+        self._resolved_blas_threads_ = resolved_blas_threads
+        self._log(
+            "[BLAS] policy="
+            f"{self.blas_thread_policy} resolved_threads={resolved_blas_threads}"
+        )
+
+        with self._blas_thread_limit_context(resolved_blas_threads):
+            paths, lambda_star, stats = self._select_paths_and_lambda_classifier(
+                theta_tr_greedy, y_tr_greedy, theta_val, y_val
+            )
+
+        theta_all = np.vstack([theta_tr, theta_val])
+        y_all = np.concatenate([y_tr, y_val])
+
+        with self._blas_thread_limit_context(resolved_blas_threads):
+            t_design_start = time.perf_counter()
+            phi_all = self._build_design_matrix(theta_all, paths)
+            t_design_end = time.perf_counter()
+            coefficients = self._fit_logistic_irls(phi_all, y_all, lambda_star)
+            t_solve_end = time.perf_counter()
+
+        self._save_learned_state(paths, lambda_star, coefficients)
+        self._cache_ray_structures(paths)
+
+        feature_importance = self._compute_feature_importance_from_model()
+        phase_timings = PhaseTimings(
+            preprocessing_sec=preprocessing_time,
+            greedy_accumulation_sec=stats.accumulation_time_sec,
+            greedy_scoring_sec=stats.scoring_time_sec,
+            lambda_sweep_sec=stats.lambda_sweep_time_sec,
+            final_normal_eqn_sec=t_design_end - t_design_start,
+            final_solve_sec=t_solve_end - t_design_end,
+            total_fit_sec=time.perf_counter() - t_fit_start,
+        )
+        self.fit_report_ = FitReport(
+            lambda_star=lambda_star,
+            selected_count=len(paths),
+            greedy_time_sec=stats.time_taken,
+            final_solve_time_sec=t_solve_end - t_design_end,
+            history=stats.history,
+            stopped_early=stats.stopped_early,
+            feature_importance=feature_importance,
+            phase_timings=phase_timings,
+            blas_threads=BlasThreadInfo(
+                policy=self.blas_thread_policy,
+                resolved_threads=resolved_blas_threads,
+            ),
+        )
+        return self
+
+    def decision_function(self, X: Array) -> Array:
+        """Return the fitted logits for each sample."""
+        return super().predict(X)
+
+    def predict_proba(self, X: Array) -> Array:
+        """Return class probabilities as a two-column array."""
+        logits = self.decision_function(X)
+        prob_pos = _clip_probabilities(_sigmoid(logits), eps=self.irls_eps)
+        return np.column_stack([1.0 - prob_pos, prob_pos])
+
+    def predict(self, X: Array) -> Array:
+        """Predict hard binary labels using a 0.5 probability threshold."""
+        prob_pos = self.predict_proba(X)[:, 1]
+        return (prob_pos >= 0.5).astype(int)
+
+    def score(self, X: Array, y: Array) -> float:
+        """Return binary classification accuracy."""
+        y_true = self._validate_binary_targets(y)
+        prob_pos = self.predict_proba(X)[:, 1]
+        return _binary_accuracy(y_true, prob_pos)

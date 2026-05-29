@@ -1,12 +1,12 @@
 # spectral-paths
 
-Spectral-path regression in Python. This project provides a `SpectralPathRegressor` model that builds spectral path features, selects a sparse dictionary with a greedy procedure, and fits ridge-style coefficients with optional early stopping and final refit. It uses directional harmonics to approximate the target as a smooth function and is inspired by Chebyshev polynomials.
+Spectral-path modeling in Python. This project provides a `SpectralPathRegressor` for regression and a `SpectralPathClassifier` for binary classification. Both models build spectral path features, select a sparse dictionary with a greedy procedure, and then fit coefficients in closed-form or with IRLS. They use directional harmonics to approximate the target and are inspired by Chebyshev polynomials.
 
 ## Features
 - Spectral-path feature construction with configurable sparsity (`k_values`).
 - Greedy selection with validation-based early stopping.
 - Robust input scaling options via `AngularTransformer`.
-- Simple, scikit-learn–style API (`fit`, `predict`).
+- Simple, scikit-learn–style APIs (`fit`, `predict`, and `predict_proba` for classification).
 
 ## Installation
 This repo uses Poetry.
@@ -51,10 +51,33 @@ model.fit(X, y)
 preds = model.predict(X)
 ```
 
+Binary classification:
+
+```python
+import numpy as np
+from spectral_paths.model import SpectralPathClassifier
+
+rng = np.random.default_rng(0)
+X = rng.normal(size=(400, 8))
+y = (X[:, 0] - 0.8 * X[:, 1] > 0.0).astype(int)
+
+model = SpectralPathClassifier(
+    max_paths=128,
+    block_size=X.shape[1],
+    lambda_grid=np.logspace(-4, 0, 8),
+    scaler_type="robust_tanh",
+    k_values=(1, 2, 3),
+)
+model.fit(X, y)
+probas = model.predict_proba(X)
+preds = model.predict(X)
+```
+
 ## Examples
 - OpenML datasets: `examples/openml.py`
 - PMLB datasets: `examples/pmlb.py`
 - Local CPU benchmark: `examples/benchmark_cpu.py`
+- Binary classification benchmark: `examples/benchmark_classification.py`
 
 Run an example with:
 

@@ -1,4 +1,4 @@
-"""This module contains helper functiosn for the model."""
+"""This module contains helper functions for the spectral path models."""
 
 import math
 from typing import List, Sequence, Tuple
@@ -215,3 +215,34 @@ def _metrics(y_true: Array, y_pred: Array) -> Tuple[float, float]:
     rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
     r2 = float(r2_score(y_true, y_pred))
     return rmse, r2
+
+
+def _sigmoid(logits: Array) -> Array:
+    """Compute the logistic sigmoid in a numerically stable way."""
+    logits = np.asarray(logits, dtype=float)
+    out = np.empty_like(logits, dtype=float)
+    positive = logits >= 0.0
+    negative = ~positive
+    out[positive] = 1.0 / (1.0 + np.exp(-logits[positive]))
+    exp_logits = np.exp(logits[negative])
+    out[negative] = exp_logits / (1.0 + exp_logits)
+    return out
+
+
+def _clip_probabilities(probabilities: Array, eps: float = 1e-12) -> Array:
+    """Clip probabilities away from 0 and 1 for stable log-loss calculations."""
+    return np.clip(np.asarray(probabilities, dtype=float), eps, 1.0 - eps)
+
+
+def _binary_log_loss(y_true: Array, y_prob: Array, eps: float = 1e-12) -> float:
+    """Compute binary cross-entropy from labels and positive-class probabilities."""
+    y_true = np.asarray(y_true, dtype=float).ravel()
+    y_prob = _clip_probabilities(y_prob, eps=eps).ravel()
+    return float(-np.mean(y_true * np.log(y_prob) + (1.0 - y_true) * np.log(1.0 - y_prob)))
+
+
+def _binary_accuracy(y_true: Array, y_prob: Array, threshold: float = 0.5) -> float:
+    """Compute binary classification accuracy from probabilities."""
+    y_true = np.asarray(y_true, dtype=float).ravel()
+    y_pred = (np.asarray(y_prob, dtype=float).ravel() >= threshold).astype(float)
+    return float(np.mean(y_pred == y_true))
